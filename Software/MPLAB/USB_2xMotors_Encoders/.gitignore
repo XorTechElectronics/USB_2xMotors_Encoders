@@ -1,0 +1,17 @@
+# MPLAB X build artifacts
+dist/
+build/
+.generated_files/
+nbproject/Makefile-*
+nbproject/Package-*
+nbproject/private/
+
+# IDE-specific metadata
+*.X.user
+*.X.dnb
+*.X.dnb.*
+*.X.lock
+
+# OS-specific clutter
+.DS_Store
+Thumbs.db
