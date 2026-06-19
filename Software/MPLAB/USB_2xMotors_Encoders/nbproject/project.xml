@@ -3,7 +3,7 @@
     <type>com.microchip.mplab.nbide.embedded.makeproject</type>
     <configuration>
         <data xmlns="http://www.netbeans.org/ns/make-project/1">
-            <name>USB_MF_MotorDriver</name>
+            <name>USB_2xMotors_Encoders</name>
             <creation-uuid>f834c8c1-535a-4f97-b0b7-1840e1326ad3</creation-uuid>
             <make-project-type>0</make-project-type>
             <sourceEncoding>ISO-8859-1</sourceEncoding>
