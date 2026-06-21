@@ -13,7 +13,7 @@
 */
 
 /*
-© [2025] Microchip Technology Inc. and its subsidiaries.
+© [2026] Microchip Technology Inc. and its subsidiaries.
 
     Subject to your compliance with these terms, you may use Microchip 
     software and any derivatives exclusively with Microchip products. 
@@ -34,27 +34,131 @@
 */
 #include "mcc_generated_files/system/system.h"
 
+#include "string.h"
+
 #include "usb_cdc.h"
 #include "usb_cdc_virtual_serial_port.h"
 
 #include "../timer/delay.h"
 
-
-
 // USB status variables
     volatile RETURN_CODE_t      usbStatus   = SUCCESS;
     volatile CDC_RETURN_CODE_t  cdcStatus   = CDC_SUCCESS;
     
+//Encoder Counters
+    volatile uint8_t    m1_prev_state = 0;    
+    volatile long       motor1_count  = 0;
+    
+    volatile uint8_t    m2_prev_state = 0;
+    volatile long       motor2_count  = 0;    
+    
+    const int8_t QEM_TABLE[16] = {
+         0, -1,  1,  0,
+         1,  0,  0, -1,
+        -1,  0,  0,  1,
+         0,  1, -1,  0
+    };    
+    
+//##############################################################################    
+//ISRs    
+//##############################################################################
+    
+    // Motor 1 encoder ISR ? triggered on encA's rising & falling edge
+    void M1_enc_ISR() {
+        LED0_Toggle();
+        uint8_t a = M1_encA_GetValue() ? 1 : 0;
+        uint8_t b = M1_encB_GetValue() ? 1 : 0;        
+        
+        uint8_t new_state   = (a << 1) | b;
+        uint8_t index       = (m1_prev_state << 2) | new_state;
+        int8_t delta        = QEM_TABLE[index];
+        motor1_count       += delta;
+                
+        // TEMP DEBUG: send raw values out so we can see the actual sequence
+        //SendDebugBytes(m1_prev_state, new_state, index, delta);  // however you want to get this out ? UART print, USB packet, even just blink a pattern
+                
+        m1_prev_state = new_state;
+    } 
+
+    // Motor 2 encoder ISR ? triggered on encA's rising & falling edge
+    void M2_enc_ISR() {
+        LED1_Toggle();
+        uint8_t a = M2_encA_GetValue() ? 1 : 0;
+        uint8_t b = M2_encB_GetValue() ? 1 : 0;        
+        
+        uint8_t new_state   = (a << 1) | b;
+        uint8_t index       = (m2_prev_state << 2) | new_state;
+        int8_t delta        = QEM_TABLE[index];
+        motor2_count       += delta;
+                
+        // TEMP DEBUG: send raw values out so we can see the actual sequence
+        //SendDebugBytes(m2_prev_state, new_state, index, delta);  // however you want to get this out ? UART print, USB packet, even just blink a pattern
+                
+        m2_prev_state = new_state;
+    } 
+    
+//##############################################################################    
+//USB CDC Send functions
+//##############################################################################    
+    
+    void SendEncoderDataBinary(long enc1, long enc2)
+    {
+        uint8_t packet[9];
+        packet[0] = 0xAA;  // sync byte so host can find the start
+
+        memcpy(&packet[1], &enc1, sizeof(long));
+        memcpy(&packet[5], &enc2, sizeof(long));
+
+        for (int i = 0; i < 9; i++)
+        {
+            if (USB_CDCWrite(packet[i]) == CDC_BUFFER_FULL)
+            {
+                // byte was dropped ? buffer was full, decide how you want to handle this
+            }
+        }
+    }   
+    
+    void SendDebugBytes(uint8_t prev_state, uint8_t new_state, uint8_t index, int8_t delta)
+    {
+        uint8_t packet[5];
+        packet[0] = 0xBB;
+        packet[1] = prev_state;
+        packet[2] = new_state;
+        packet[3] = index;
+        packet[4] = (uint8_t)delta;
+
+        for (int i = 0; i < 5; i++)
+        {
+            USB_CDCWrite(packet[i]);
+        }
+    }    
+    
+    
+    
+    
+    
+    
 /*
     Main application
 */
+
 int main(void)
 {
     // Data variable
         uint8_t cdcData;  
-        uint8_t usartData;
         
     SYSTEM_Initialize();
+    
+    //Encoder State Initialization
+        m1_prev_state = (M1_encA_GetValue() << 1) | M1_encB_GetValue();
+        m2_prev_state = (M2_encA_GetValue() << 1) | M2_encB_GetValue();
+    
+    //Interrupt on both edges of encA and encB, firing off the same ISR
+        M1_encA_SetInterruptHandler ( M1_enc_ISR );
+        M1_encB_SetInterruptHandler ( M1_enc_ISR );
+    
+        M2_encA_SetInterruptHandler ( M2_enc_ISR );
+        M2_encB_SetInterruptHandler ( M2_enc_ISR );
         
     // Start USB operations
         usbStatus = USB_Start();   
@@ -75,13 +179,30 @@ int main(void)
         {
             while (1)
             {
-                LED_Toggle();
+                LED0_Toggle();
                 DELAY_milliseconds(100);
             }
         }
         else                      
         {
             uint8_t count = 0x00;    
+            
+            // Read encoders safely into loop
+            cli();
+                long motor1_encoders_safe = motor1_count;
+                long motor2_encoders_safe = motor2_count;
+                
+                //long motor1_encoders_safe = 67;
+                //long motor2_encoders_safe = 45;
+            sei();            
+            
+            SendEncoderDataBinary( motor1_encoders_safe, motor2_encoders_safe );
+            
+            
+            
+            
+            
+            
 
             //Check and parse anything received
             while ( USB_CDCRead(&cdcData) == CDC_SUCCESS )  // Read one byte at a time
@@ -90,15 +211,16 @@ int main(void)
                 
                 switch ( count ) {
                     case 0:                             //Motor Standby
-                        LED_Toggle();
+                        LED0_Toggle();
                     
                         //Bit 0 to standby Motors 0 and 1
                             if ( cdcData&(1<<0) )   {   M01_STBY_SetHigh(); }
                             else                    {   M01_STBY_SetLow();  }
                         
-                        //Bit 1 to standby Motors 2 and 3
-                            if ( cdcData&(1<<1) )   {   M23_STBY_SetHigh(); }
-                            else                    {   M23_STBY_SetLow();  }                        
+//                        //Bit 1 to standby Motors 2 and 3
+//                            if ( cdcData&(1<<1) )   {   M23_STBY_SetHigh(); }
+//                            else                    {   M23_STBY_SetLow();  }
+                    break;
                         
                     case 1:                             //M0 Control                    
                         //Bit 0 to M0_IN1
@@ -108,7 +230,8 @@ int main(void)
                         //Bit 1 to M0_IN2
                             if ( cdcData&(1<<1) )   {   M0_IN2_SetHigh(); }
                             else                    {   M0_IN2_SetLow();  }                                            
-                        
+                    break;
+                            
                     case 2:                             //M0 PWM       
                         TCA0.SPLIT.LCMP1 = cdcData;     //WO1 from IC
                     break;
@@ -120,45 +243,18 @@ int main(void)
                         
                         //Bit 1 to M1_IN2
                             if ( cdcData&(1<<1) )   {   M1_IN2_SetHigh(); }
-                            else                    {   M1_IN2_SetLow();  }                     
+                            else                    {   M1_IN2_SetLow();  }  
+                    break;
                     
                     case 4:                             //M1 PWM
                         TCA0.SPLIT.LCMP0 = cdcData;     //WO0 from IC
                     break;
-
-                    case 5:                             //M2 Control                    
-                        //Bit 0 to M1_IN1
-                            if ( cdcData&(1<<0) )   {   M2_IN1_SetHigh(); }
-                            else                    {   M2_IN1_SetLow();  }
-                        
-                        //Bit 1 to M1_IN2
-                            if ( cdcData&(1<<1) )   {   M2_IN2_SetHigh(); }
-                            else                    {   M2_IN2_SetLow();  }                                         
-                    
-                    case 6:                             //M2 PWM                        
-                        TCA0.SPLIT.HCMP0 = cdcData;     //WO3 from IC
-                    break;
-                    
-                    case 7:                             //M3 Control                    
-                        //Bit 0 to M1_IN1
-                            if ( cdcData&(1<<0) )   {   M3_IN1_SetHigh(); }
-                            else                    {   M3_IN1_SetLow();  }
-                        
-                        //Bit 1 to M1_IN2
-                            if ( cdcData&(1<<1) )   {   M3_IN2_SetHigh(); }
-                            else                    {   M3_IN2_SetLow();  }                                         
-                    
-                    case 8:                             //M3 PWM
-                        TCA0.SPLIT.LCMP2 = cdcData;     //WO2 from IC
-                    break;                    
                     
                     default:
                         
                     break;
                 }
-                    
-            
-                
+                                    
                 count = count + 1;
             }
 

@@ -11,7 +11,7 @@
 */
 
 /*
-© [2025] Microchip Technology Inc. and its subsidiaries.
+© [2026] Microchip Technology Inc. and its subsidiaries.
 
     Subject to your compliance with these terms, you may use Microchip 
     software and any derivatives exclusively with Microchip products. 
@@ -47,6 +47,7 @@ int8_t CPUINT_Initialize()
     //LVL1VEC 0; 
     CPUINT.LVL1VEC = 0x0;
 
+    ENABLE_INTERRUPTS(); 
         
     return 0;
 }

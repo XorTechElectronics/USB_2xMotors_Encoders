@@ -12,7 +12,7 @@
 */
 
 /*
-© [2025] Microchip Technology Inc. and its subsidiaries.
+© [2026] Microchip Technology Inc. and its subsidiaries.
 
     Subject to your compliance with these terms, you may use Microchip 
     software and any derivatives exclusively with Microchip products. 
@@ -40,18 +40,18 @@ static void (*IO_PF0_InterruptHandler)(void);
 static void (*IO_PF1_InterruptHandler)(void);
 static void (*IO_PF2_InterruptHandler)(void);
 static void (*IO_PF3_InterruptHandler)(void);
+static void (*M1_encB_InterruptHandler)(void);
+static void (*M1_encA_InterruptHandler)(void);
+static void (*M2_encA_InterruptHandler)(void);
+static void (*M2_encB_InterruptHandler)(void);
 static void (*SS_InterruptHandler)(void);
-static void (*LED_InterruptHandler)(void);
+static void (*LED0_InterruptHandler)(void);
 static void (*M1_IN2_InterruptHandler)(void);
 static void (*M1_IN1_InterruptHandler)(void);
 static void (*M01_STBY_InterruptHandler)(void);
 static void (*M0_IN1_InterruptHandler)(void);
-static void (*M23_STBY_InterruptHandler)(void);
-static void (*M3_IN2_InterruptHandler)(void);
-static void (*M3_IN1_InterruptHandler)(void);
+static void (*LED1_InterruptHandler)(void);
 static void (*M0_IN2_InterruptHandler)(void);
-static void (*M2_IN1_InterruptHandler)(void);
-static void (*M2_IN2_InterruptHandler)(void);
 
 void PIN_MANAGER_Initialize()
 {
@@ -65,8 +65,8 @@ void PIN_MANAGER_Initialize()
   /* DIR Registers Initialization */
     PORTA.DIR = 0x81;
     PORTC.DIR = 0x8;
-    PORTD.DIR = 0xFF;
-    PORTF.DIR = 0x3F;
+    PORTD.DIR = 0x9F;
+    PORTF.DIR = 0xF;
 
   /* PINxCTRL registers Initialization */
     PORTA.PIN0CTRL = 0x0;
@@ -90,15 +90,15 @@ void PIN_MANAGER_Initialize()
     PORTD.PIN2CTRL = 0x0;
     PORTD.PIN3CTRL = 0x0;
     PORTD.PIN4CTRL = 0x0;
-    PORTD.PIN5CTRL = 0x0;
-    PORTD.PIN6CTRL = 0x0;
+    PORTD.PIN5CTRL = 0x1;
+    PORTD.PIN6CTRL = 0x1;
     PORTD.PIN7CTRL = 0x0;
     PORTF.PIN0CTRL = 0x0;
     PORTF.PIN1CTRL = 0x0;
     PORTF.PIN2CTRL = 0x0;
     PORTF.PIN3CTRL = 0x0;
-    PORTF.PIN4CTRL = 0x0;
-    PORTF.PIN5CTRL = 0x0;
+    PORTF.PIN4CTRL = 0x1;
+    PORTF.PIN5CTRL = 0x1;
     PORTF.PIN6CTRL = 0x0;
     PORTF.PIN7CTRL = 0x0;
 
@@ -118,18 +118,18 @@ void PIN_MANAGER_Initialize()
     IO_PF1_SetInterruptHandler(IO_PF1_DefaultInterruptHandler);
     IO_PF2_SetInterruptHandler(IO_PF2_DefaultInterruptHandler);
     IO_PF3_SetInterruptHandler(IO_PF3_DefaultInterruptHandler);
+    M1_encB_SetInterruptHandler(M1_encB_DefaultInterruptHandler);
+    M1_encA_SetInterruptHandler(M1_encA_DefaultInterruptHandler);
+    M2_encA_SetInterruptHandler(M2_encA_DefaultInterruptHandler);
+    M2_encB_SetInterruptHandler(M2_encB_DefaultInterruptHandler);
     SS_SetInterruptHandler(SS_DefaultInterruptHandler);
-    LED_SetInterruptHandler(LED_DefaultInterruptHandler);
+    LED0_SetInterruptHandler(LED0_DefaultInterruptHandler);
     M1_IN2_SetInterruptHandler(M1_IN2_DefaultInterruptHandler);
     M1_IN1_SetInterruptHandler(M1_IN1_DefaultInterruptHandler);
     M01_STBY_SetInterruptHandler(M01_STBY_DefaultInterruptHandler);
     M0_IN1_SetInterruptHandler(M0_IN1_DefaultInterruptHandler);
-    M23_STBY_SetInterruptHandler(M23_STBY_DefaultInterruptHandler);
-    M3_IN2_SetInterruptHandler(M3_IN2_DefaultInterruptHandler);
-    M3_IN1_SetInterruptHandler(M3_IN1_DefaultInterruptHandler);
+    LED1_SetInterruptHandler(LED1_DefaultInterruptHandler);
     M0_IN2_SetInterruptHandler(M0_IN2_DefaultInterruptHandler);
-    M2_IN1_SetInterruptHandler(M2_IN1_DefaultInterruptHandler);
-    M2_IN2_SetInterruptHandler(M2_IN2_DefaultInterruptHandler);
 }
 
 /**
@@ -211,6 +211,58 @@ void IO_PF3_DefaultInterruptHandler(void)
     // or set custom function using IO_PF3_SetInterruptHandler()
 }
 /**
+  Allows selecting an interrupt handler for M1_encB at application runtime
+*/
+void M1_encB_SetInterruptHandler(void (* interruptHandler)(void)) 
+{
+    M1_encB_InterruptHandler = interruptHandler;
+}
+
+void M1_encB_DefaultInterruptHandler(void)
+{
+    // add your M1_encB interrupt custom code
+    // or set custom function using M1_encB_SetInterruptHandler()
+}
+/**
+  Allows selecting an interrupt handler for M1_encA at application runtime
+*/
+void M1_encA_SetInterruptHandler(void (* interruptHandler)(void)) 
+{
+    M1_encA_InterruptHandler = interruptHandler;
+}
+
+void M1_encA_DefaultInterruptHandler(void)
+{
+    // add your M1_encA interrupt custom code
+    // or set custom function using M1_encA_SetInterruptHandler()
+}
+/**
+  Allows selecting an interrupt handler for M2_encA at application runtime
+*/
+void M2_encA_SetInterruptHandler(void (* interruptHandler)(void)) 
+{
+    M2_encA_InterruptHandler = interruptHandler;
+}
+
+void M2_encA_DefaultInterruptHandler(void)
+{
+    // add your M2_encA interrupt custom code
+    // or set custom function using M2_encA_SetInterruptHandler()
+}
+/**
+  Allows selecting an interrupt handler for M2_encB at application runtime
+*/
+void M2_encB_SetInterruptHandler(void (* interruptHandler)(void)) 
+{
+    M2_encB_InterruptHandler = interruptHandler;
+}
+
+void M2_encB_DefaultInterruptHandler(void)
+{
+    // add your M2_encB interrupt custom code
+    // or set custom function using M2_encB_SetInterruptHandler()
+}
+/**
   Allows selecting an interrupt handler for SS at application runtime
 */
 void SS_SetInterruptHandler(void (* interruptHandler)(void)) 
@@ -224,17 +276,17 @@ void SS_DefaultInterruptHandler(void)
     // or set custom function using SS_SetInterruptHandler()
 }
 /**
-  Allows selecting an interrupt handler for LED at application runtime
+  Allows selecting an interrupt handler for LED0 at application runtime
 */
-void LED_SetInterruptHandler(void (* interruptHandler)(void)) 
+void LED0_SetInterruptHandler(void (* interruptHandler)(void)) 
 {
-    LED_InterruptHandler = interruptHandler;
+    LED0_InterruptHandler = interruptHandler;
 }
 
-void LED_DefaultInterruptHandler(void)
+void LED0_DefaultInterruptHandler(void)
 {
-    // add your LED interrupt custom code
-    // or set custom function using LED_SetInterruptHandler()
+    // add your LED0 interrupt custom code
+    // or set custom function using LED0_SetInterruptHandler()
 }
 /**
   Allows selecting an interrupt handler for M1_IN2 at application runtime
@@ -289,43 +341,17 @@ void M0_IN1_DefaultInterruptHandler(void)
     // or set custom function using M0_IN1_SetInterruptHandler()
 }
 /**
-  Allows selecting an interrupt handler for M23_STBY at application runtime
+  Allows selecting an interrupt handler for LED1 at application runtime
 */
-void M23_STBY_SetInterruptHandler(void (* interruptHandler)(void)) 
+void LED1_SetInterruptHandler(void (* interruptHandler)(void)) 
 {
-    M23_STBY_InterruptHandler = interruptHandler;
+    LED1_InterruptHandler = interruptHandler;
 }
 
-void M23_STBY_DefaultInterruptHandler(void)
+void LED1_DefaultInterruptHandler(void)
 {
-    // add your M23_STBY interrupt custom code
-    // or set custom function using M23_STBY_SetInterruptHandler()
-}
-/**
-  Allows selecting an interrupt handler for M3_IN2 at application runtime
-*/
-void M3_IN2_SetInterruptHandler(void (* interruptHandler)(void)) 
-{
-    M3_IN2_InterruptHandler = interruptHandler;
-}
-
-void M3_IN2_DefaultInterruptHandler(void)
-{
-    // add your M3_IN2 interrupt custom code
-    // or set custom function using M3_IN2_SetInterruptHandler()
-}
-/**
-  Allows selecting an interrupt handler for M3_IN1 at application runtime
-*/
-void M3_IN1_SetInterruptHandler(void (* interruptHandler)(void)) 
-{
-    M3_IN1_InterruptHandler = interruptHandler;
-}
-
-void M3_IN1_DefaultInterruptHandler(void)
-{
-    // add your M3_IN1 interrupt custom code
-    // or set custom function using M3_IN1_SetInterruptHandler()
+    // add your LED1 interrupt custom code
+    // or set custom function using LED1_SetInterruptHandler()
 }
 /**
   Allows selecting an interrupt handler for M0_IN2 at application runtime
@@ -339,32 +365,6 @@ void M0_IN2_DefaultInterruptHandler(void)
 {
     // add your M0_IN2 interrupt custom code
     // or set custom function using M0_IN2_SetInterruptHandler()
-}
-/**
-  Allows selecting an interrupt handler for M2_IN1 at application runtime
-*/
-void M2_IN1_SetInterruptHandler(void (* interruptHandler)(void)) 
-{
-    M2_IN1_InterruptHandler = interruptHandler;
-}
-
-void M2_IN1_DefaultInterruptHandler(void)
-{
-    // add your M2_IN1 interrupt custom code
-    // or set custom function using M2_IN1_SetInterruptHandler()
-}
-/**
-  Allows selecting an interrupt handler for M2_IN2 at application runtime
-*/
-void M2_IN2_SetInterruptHandler(void (* interruptHandler)(void)) 
-{
-    M2_IN2_InterruptHandler = interruptHandler;
-}
-
-void M2_IN2_DefaultInterruptHandler(void)
-{
-    // add your M2_IN2 interrupt custom code
-    // or set custom function using M2_IN2_SetInterruptHandler()
 }
 ISR(PORTA_PORT_vect)
 { 
@@ -390,7 +390,7 @@ ISR(PORTC_PORT_vect)
     // Call the interrupt handler for the callback registered at runtime
     if(VPORTC.INTFLAGS & PORT_INT3_bm)
     {
-       LED_InterruptHandler(); 
+       LED0_InterruptHandler(); 
     }
     /* Clear interrupt flags */
     VPORTC.INTFLAGS = 0xff;
@@ -399,6 +399,14 @@ ISR(PORTC_PORT_vect)
 ISR(PORTD_PORT_vect)
 { 
     // Call the interrupt handler for the callback registered at runtime
+    if(VPORTD.INTFLAGS & PORT_INT5_bm)
+    {
+       M1_encB_InterruptHandler(); 
+    }
+    if(VPORTD.INTFLAGS & PORT_INT6_bm)
+    {
+       M1_encA_InterruptHandler(); 
+    }
     if(VPORTD.INTFLAGS & PORT_INT0_bm)
     {
        M1_IN2_InterruptHandler(); 
@@ -417,15 +425,7 @@ ISR(PORTD_PORT_vect)
     }
     if(VPORTD.INTFLAGS & PORT_INT4_bm)
     {
-       M23_STBY_InterruptHandler(); 
-    }
-    if(VPORTD.INTFLAGS & PORT_INT5_bm)
-    {
-       M3_IN2_InterruptHandler(); 
-    }
-    if(VPORTD.INTFLAGS & PORT_INT6_bm)
-    {
-       M3_IN1_InterruptHandler(); 
+       LED1_InterruptHandler(); 
     }
     if(VPORTD.INTFLAGS & PORT_INT7_bm)
     {
@@ -456,11 +456,11 @@ ISR(PORTF_PORT_vect)
     }
     if(VPORTF.INTFLAGS & PORT_INT4_bm)
     {
-       M2_IN1_InterruptHandler(); 
+       M2_encA_InterruptHandler(); 
     }
     if(VPORTF.INTFLAGS & PORT_INT5_bm)
     {
-       M2_IN2_InterruptHandler(); 
+       M2_encB_InterruptHandler(); 
     }
     /* Clear interrupt flags */
     VPORTF.INTFLAGS = 0xff;
