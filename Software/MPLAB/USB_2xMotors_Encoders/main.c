@@ -34,6 +34,7 @@
 */
 #include "mcc_generated_files/system/system.h"
 
+#include <stdio.h>
 #include "string.h"
 
 #include "usb_cdc.h"
@@ -59,17 +60,33 @@
          0,  1, -1,  0
     };    
     
+    
+static inline uint8_t read_encoder_state_M1(void) {
+    uint8_t a = M1_encA_GetValue() ? 1 : 0;
+    uint8_t b = M1_encB_GetValue() ? 1 : 0;
+    return (a << 1) | b;
+}    
+
+static inline uint8_t read_encoder_state_M2(void) {
+    uint8_t a = M2_encA_GetValue() ? 1 : 0;
+    uint8_t b = M2_encB_GetValue() ? 1 : 0;
+    return (a << 1) | b;
+}
+    
 //##############################################################################    
 //ISRs    
 //##############################################################################
-    
-    // Motor 1 encoder ISR ? triggered on encA's rising & falling edge
-    void M1_enc_ISR() {
-        LED0_Toggle();
-        uint8_t a = M1_encA_GetValue() ? 1 : 0;
-        uint8_t b = M1_encB_GetValue() ? 1 : 0;        
+    // Add a separate counter just to count raw ISR calls, 
+    // completely independent of the quadrature logic:
+        volatile uint32_t m1_isr_call_count = 0;    
+
+
+
+    // Motor 1 encoder ISR ? triggered on encA's and encB's rising & falling edge
+    void M1_enc_ISR() {    
+        m1_isr_call_count++;
         
-        uint8_t new_state   = (a << 1) | b;
+        uint8_t new_state   = read_encoder_state_M1();
         uint8_t index       = (m1_prev_state << 2) | new_state;
         int8_t delta        = QEM_TABLE[index];
         motor1_count       += delta;
@@ -80,13 +97,9 @@
         m1_prev_state = new_state;
     } 
 
-    // Motor 2 encoder ISR ? triggered on encA's rising & falling edge
+    // Motor 2 encoder ISR ? triggered on encA's and encB's rising & falling edge
     void M2_enc_ISR() {
-        LED1_Toggle();
-        uint8_t a = M2_encA_GetValue() ? 1 : 0;
-        uint8_t b = M2_encB_GetValue() ? 1 : 0;        
-        
-        uint8_t new_state   = (a << 1) | b;
+        uint8_t new_state   = read_encoder_state_M2();
         uint8_t index       = (m2_prev_state << 2) | new_state;
         int8_t delta        = QEM_TABLE[index];
         motor2_count       += delta;
@@ -132,8 +145,50 @@
             USB_CDCWrite(packet[i]);
         }
     }    
+  
+//##############################################################################    
+//UART functions
+//##############################################################################     
+void UART_WriteByte(uint8_t byte) {
+    while (!USART0_IsTxReady());
+    USART0_Write(byte);
+}    
     
     
+void UART_PrintLong(int32_t value) {
+    char buf[12];
+    int8_t i = 0;
+
+    if (value == INT32_MIN) {
+        const char *s = "-2147483648\r\n";
+        while (*s) { UART_WriteByte((uint8_t)*s++); }// DELAY_milliseconds(5); }
+        return;
+    }
+
+    if (value < 0) {
+        UART_WriteByte('-');
+        //DELAY_milliseconds(5);
+        value = -value;
+    }
+
+    if (value == 0) {
+        UART_WriteByte('0');
+    } else {
+        while (value > 0) {
+            buf[i++] = '0' + (value % 10);
+            value /= 10;
+        }
+        for (int8_t j = i - 1; j >= 0; j--) {
+            UART_WriteByte((uint8_t)buf[j]);
+            //DELAY_milliseconds(5);
+        }
+    }
+
+    UART_WriteByte('\r');
+    //DELAY_milliseconds(5);
+    UART_WriteByte('\n');
+    //DELAY_milliseconds(5);
+} 
     
     
     
@@ -150,9 +205,9 @@ int main(void)
     SYSTEM_Initialize();
     
     //Encoder State Initialization
-        m1_prev_state = (M1_encA_GetValue() << 1) | M1_encB_GetValue();
-        m2_prev_state = (M2_encA_GetValue() << 1) | M2_encB_GetValue();
-    
+        m1_prev_state = read_encoder_state_M1();
+        m2_prev_state = read_encoder_state_M2();
+        
     //Interrupt on both edges of encA and encB, firing off the same ISR
         M1_encA_SetInterruptHandler ( M1_enc_ISR );
         M1_encB_SetInterruptHandler ( M1_enc_ISR );
@@ -163,11 +218,19 @@ int main(void)
     // Start USB operations
         usbStatus = USB_Start();   
         
+        
+
+        
     //Test
         //M01_STBY_SetHigh();
         //M0_IN1_SetHigh();
         //M0_IN2_SetLow();
         //TCA0.SPLIT.LCMP0 = 0xEF; 
+        //long test  = 29997; 
+        //UART_PrintLong ( test );    
+        
+    // Add near top of main, before while(1):
+    static uint16_t enc_send_counter = 0;        
 
     while(1)
     {        
@@ -188,17 +251,32 @@ int main(void)
             uint8_t count = 0x00;    
             
             // Read encoders safely into loop
-            cli();
-                long motor1_encoders_safe = motor1_count;
-                long motor2_encoders_safe = motor2_count;
+//            cli();
+//                long motor1_encoders_safe = motor1_count;
+//                long motor2_encoders_safe = motor2_count;
+//                
+//                //long motor1_encoders_safe = 67;
+//               //long motor2_encoders_safe = 45;
+//            sei();            
+//            
+//            SendEncoderDataBinary( motor1_encoders_safe, motor2_encoders_safe );
+            
+            // Only send encoder data every N iterations rather than
+            // every loop. Tune N until delta is non-zero in the GUI.
+            // At ~1us/loop you'd need N~10000 for 10ms; at ~10us/loop
+            // N~1000. Start with 1000 and adjust.
+            enc_send_counter++;
+            if (enc_send_counter >= 3000)
+            {
+                LED0_Toggle();
                 
-                //long motor1_encoders_safe = 67;
-                //long motor2_encoders_safe = 45;
-            sei();            
-            
-            SendEncoderDataBinary( motor1_encoders_safe, motor2_encoders_safe );
-            
-            
+                enc_send_counter = 0;
+                cli();
+                    long motor1_encoders_safe = motor1_count;
+                    long motor2_encoders_safe = motor2_count;
+                sei();
+                SendEncoderDataBinary(motor1_encoders_safe, motor2_encoders_safe);
+            }            
             
             
             
@@ -207,7 +285,7 @@ int main(void)
             //Check and parse anything received
             while ( USB_CDCRead(&cdcData) == CDC_SUCCESS )  // Read one byte at a time
             {   
-                USART0_Write(cdcData);
+                //USART0_Write(cdcData);
                 
                 switch ( count ) {
                     case 0:                             //Motor Standby
@@ -229,7 +307,13 @@ int main(void)
                         
                         //Bit 1 to M0_IN2
                             if ( cdcData&(1<<1) )   {   M0_IN2_SetHigh(); }
-                            else                    {   M0_IN2_SetLow();  }                                            
+                            else                    {   M0_IN2_SetLow();  }  
+                            
+                        //Debug 
+                        //motor1_encoders_safe onto UART
+                            UART_PrintLong ( motor1_count );
+                            UART_PrintLong ( m1_isr_call_count );
+                            
                     break;
                             
                     case 2:                             //M0 PWM       
@@ -263,8 +347,8 @@ int main(void)
                 usbStatus = USB_CDCVirtualSerialPortHandler();                                 
         }        
         
-        //LED_Toggle();
-        //DELAY_milliseconds(2000);
+        //LED0_Toggle();
+        //DELAY_milliseconds(10);
     }    
 }
 
