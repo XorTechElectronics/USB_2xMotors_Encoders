@@ -172,88 +172,19 @@ uint8_t TCA0_MaxCountGet(void);
 
 /**
  * @ingroup tca0_split
- * @brief Clears the High Byte Timer Underflow interrupt flag.
+ * @brief Enables the timer interrupts in Split mode.
  * @param None.
  * @return None.
  */
-void TCA0_HUNFInterruptFlagClear(void);
+void TCA0_InterruptEnable(void);
 
 /**
  * @ingroup tca0_split
- * @brief Returns the status of the High Byte Timer Underflow interrupt flag.
- * @param None.
- * @retval True  - High Byte Underflow interrupt flag is set
- * @retval False - High Byte Underflow interrupt flag is not set
- */
-bool TCA0_HUNFInterruptStatusGet(void);
-
-/**
- * @ingroup tca0_split
- * @brief Clears the Low Byte Timer Underflow interrupt flag.
+ * @brief Disables the timer interrupts in Split mode.
  * @param None.
  * @return None.
  */
-void TCA0_LUNFInterruptFlagClear(void);
-
-/**
- * @ingroup tca0_split
- * @brief Returns the status of the Low Byte Timer Underflow interrupt flag.
- * @param None.
- * @retval True  - Low Byte Underflow interrupt flag is set
- * @retval False - Low Byte Underflow interrupt flag is not set
- */
-bool TCA0_LUNFInterruptStatusGet(void);
-
-/**
- * @ingroup tca0_split
- * @brief Clears the Low Byte Timer Compare Channel 0 Match interrupt flag.
- * @param None.
- * @return None.
- */
-void TCA0_LCMP0InterruptFlagClear(void);
-
-/**
- * @ingroup tca0_split
- * @brief Returns the status of the Low Byte Timer Compare Channel 0 Match interrupt flag.
- * @param None.
- * @retval True  - Low Byte Timer Compare Channel 0 Match interrupt flag is set
- * @retval False - Low Byte Timer Compare Channel 0 Match interrupt flag is not set
- */
-
-bool TCA0_LCMP0InterruptStatusGet(void);
-/**
- * @ingroup tca0_split
- * @brief Clears the Low Byte Timer Compare Channel 1 Match interrupt flag.
- * @param None.
- * @return None.
- */
-void TCA0_LCMP1InterruptFlagClear(void);
-
-/**
- * @ingroup tca0_split
- * @brief Returns the status of the Low Byte Timer Compare Channel 1 Match interrupt flag.
- * @param None.
- * @retval True  - Low Byte Timer Compare Channel 1 Match interrupt flag is set
- * @retval False - Low Byte Timer Compare Channel 1 Match interrupt flag is not set
- */
-bool TCA0_LCMP1InterruptStatusGet(void);
-
-/**
- * @ingroup tca0_split
- * @brief Clears the Low Byte Timer Compare Channel 2 Match interrupt flag.
- * @param None.
- * @return None.
- */
-void TCA0_LCMP2InterruptFlagClear(void);
-
-/**
- * @ingroup tca0_split
- * @brief Returns the status of the Low Byte Timer Compare Channel 2 Match interrupt flag.
- * @param None.
- * @retval True  - Low Byte Timer Compare Channel 2 Match interrupt flag is set
- * @retval False - Low Byte Timer Compare Channel 2 Match interrupt flag is not set
- */
-bool TCA0_LCMP2InterruptStatusGet(void);
+void TCA0_InterruptDisable(void);
 /**
  * @ingroup tca0_split
  * @brief Registers a callback function for the High Byte Timer underflow event.
@@ -293,12 +224,5 @@ void TCA0_LowCompare2CallbackRegister(TCA0_cb_t CallbackHandler);
  * @return None.
  */ 
 void TCA0_LowCountCallbackRegister(TCA0_cb_t CallbackHandler);
-/**
- * @ingroup tca0_split
- * @brief Performs tasks to be executed during the timer interrupt events.
- * @param None.
- * @return None.
- */
-void TCA0_Tasks(void);
 
 #endif /* TCA0_H_INCLUDED */

@@ -74,72 +74,16 @@
 /**
  * @ingroup tca0_split
  * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_ClearHUNFInterruptFlag will be deprecated in the future release. Use TCA0_HUNFInterruptFlagClear instead.
+ *        The TCA0_EnableInterrupt will be deprecated in the future release. Use TCA0_InterruptEnable instead.
  */
 /* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_ClearHUNFInterruptFlag TCA0_HUNFInterruptFlagClear
+#define TCA0_EnableInterrupt  TCA0_InterruptEnable
 /**
  * @ingroup tca0_split
  * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_IsHUNFInterruptFlagSet will be deprecated in the future release. Use TCA0_HUNFInterruptStatusGet instead.
+ *        The TCA0_DisableInterrupt will be deprecated in the future release. Use TCA0_InterruptDisable instead.
  */
 /* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_IsHUNFInterruptFlagSet TCA0_HUNFInterruptStatusGet
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_ClearLUNFInterruptFlag will be deprecated in the future release. Use TCA0_LUNFInterruptFlagClear instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_ClearLUNFInterruptFlag TCA0_LUNFInterruptFlagClear
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_IsLUNFInterruptFlagSet will be deprecated in the future release. Use TCA0_LUNFInterruptStatusGet instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_IsLUNFInterruptFlagSet TCA0_LUNFInterruptStatusGet
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_ClearLCMP0InterruptFlag will be deprecated in the future release. Use TCA0_LCMP0InterruptFlagClear instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_ClearLCMP0InterruptFlag TCA0_LCMP0InterruptFlagClear
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_IsLCMP0InterruptFlagSet will be deprecated in the future release. Use TCA0_LCMP0InterruptStatusGet instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_IsLCMP0InterruptFlagSet TCA0_LCMP0InterruptStatusGet
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_ClearLCMP1InterruptFlag will be deprecated in the future release. Use TCA0_LCMP1InterruptFlagClear instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_ClearLCMP1InterruptFlag TCA0_LCMP1InterruptFlagClear
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_IsLCMP1InterruptFlagSet will be deprecated in the future release. Use TCA0_LCMP1InterruptStatusGet instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_IsLCMP1InterruptFlagSet TCA0_LCMP1InterruptStatusGet
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_ClearHUNFInterruptFlag will be deprecated in the future release. Use TCA0_LCMP2InterruptFlagClear instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_ClearLCMP2InterruptFlag TCA0_LCMP2InterruptFlagClear
-/**
- * @ingroup tca0_split
- * @brief Defines the Custom Name for the \ref TCA0_CounterGet API. 
- *        The TCA0_IsLCMP2InterruptFlagSet will be deprecated in the future release. Use TCA0_LCMP2InterruptStatusGet instead.
- */
-/* cppcheck-suppress misra-c2012-2.5 */  
-#define TCA0_IsLCMP2InterruptFlagSet TCA0_LCMP2InterruptStatusGet
+#define TCA0_DisableInterrupt  TCA0_InterruptDisable
 
 #endif //TCA0_DEPRECATED_H

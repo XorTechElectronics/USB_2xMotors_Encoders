@@ -66,6 +66,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_co
 # Sensible defaults until the user sets real values in the Settings window.
 DEFAULT_PPR = 12          # pulses per revolution (encoder/motor shaft)
 DEFAULT_GEAR_RATIO = 1.0  # motor shaft revs per output shaft rev (e.g. 100.0 for a 100:1 gearbox)
+DEFAULT_WHEEL_DIAMETER_MM = 0.0  # 0 = no wheel attached, hides velocity display
 
 # Known (VID, PID) pairs for the motor controller's USB CDC interface.
 # Add your board's IDs here for reliable auto-detection on both Windows
@@ -98,13 +99,14 @@ STALE_TIMEOUT_SEC = 0.5
 
 # Whether each value read off the wire is an ABSOLUTE encoder position
 # (counts since power-on/reset - the common case, and counts UP/DOWN
-# continuously even while sitting idle) or already a DELTA (counts since
-# the previous poll). Get this wrong and RPM will be wildly inflated
-# (absolute position misread as a delta) or always read ~0 (delta
-# misread as absolute and re-diffed again).
+# continuously even while sitting idle), a DELTA (counts since the
+# previous poll), or RPM*10 (firmware has already calculated RPM and
+# multiplied by 10 for one decimal place of fixed-point precision).
+# Get this wrong and RPM will be wildly inflated or always read ~0.
 READING_MODE_ABSOLUTE = "absolute"
-READING_MODE_DELTA = "delta"
-READING_MODE = READING_MODE_ABSOLUTE
+READING_MODE_DELTA    = "delta"
+READING_MODE_RPM_X10  = "rpm_x10"   # firmware sends RPM*10 directly
+READING_MODE = READING_MODE_RPM_X10  # firmware now calculates RPM
 
 
 def printHex(input):
@@ -118,7 +120,8 @@ def printHex(input):
 def default_motor_config():
     """Return a fresh config dict: {motor_id: {"ppr": .., "gear_ratio": ..}}"""
     return {
-        str(m): {"ppr": DEFAULT_PPR, "gear_ratio": DEFAULT_GEAR_RATIO}
+        str(m): {"ppr": DEFAULT_PPR, "gear_ratio": DEFAULT_GEAR_RATIO,
+                 "wheel_diameter_mm": DEFAULT_WHEEL_DIAMETER_MM}
         for m in range(1, NUM_MOTORS + 1)
     }
 
@@ -370,6 +373,42 @@ class MotorControlPanel(ttk.LabelFrame):
         self._total_count = 0
         self.total_count_var.set("0")
 
+    def update_rpm(self, motor_shaft_rpm, gear_ratio, wheel_diameter_mm):
+        """Update display from a pre-calculated motor shaft RPM value
+        (firmware has already done the encoder maths). Applies gear
+        ratio and optional wheel diameter conversions in the GUI."""
+        rpm_abs = abs(motor_shaft_rpm)
+
+        # Direction from sign
+        if motor_shaft_rpm > 0:
+            self.direction_var.set("CW")
+        elif motor_shaft_rpm < 0:
+            self.direction_var.set("CCW")
+        else:
+            self.direction_var.set("stopped")
+
+        # Motor shaft RPM
+        self.rpm_value_var.set(f"{rpm_abs:.1f}")
+        self.raw_count_var.set(f"motor shaft: {rpm_abs:.1f} RPM")
+
+        # Accumulate total count equivalent for reference
+        self._total_count = int(motor_shaft_rpm)
+        self.total_count_var.set(f"{motor_shaft_rpm:.1f}")
+
+        # RPM stats (non-zero only)
+        if rpm_abs > 0:
+            self._rpm_window.append(rpm_abs)
+            if len(self._rpm_window) > self.RPM_WINDOW_SIZE:
+                self._rpm_window.pop(0)
+            if self._rpm_min is None or rpm_abs < self._rpm_min:
+                self._rpm_min = rpm_abs
+            if self._rpm_max is None or rpm_abs > self._rpm_max:
+                self._rpm_max = rpm_abs
+            avg = sum(self._rpm_window) / len(self._rpm_window)
+            self.avg_var.set(f"{avg:.1f}")
+            self.min_var.set(f"{self._rpm_min:.1f}")
+            self.max_var.set(f"{self._rpm_max:.1f}")
+
     def update_encoder(self, delta_counts, ppr, gear_ratio, elapsed_sec):
         """Convert a raw encoder delta and real elapsed time since the
         previous packet into output-shaft RPM. Using the actual
@@ -611,6 +650,9 @@ class MotorControlGUI:
 
     def _on_settings_saved(self, new_config):
         self.motor_config = new_config
+        # Push updated config to firmware immediately so PPR and PID
+        # gains take effect without needing to reconnect.
+        self.send_all_config()
 
     # ------------------------------------------------------------------
     # Port discovery / connection
@@ -697,6 +739,10 @@ class MotorControlGUI:
             self.serial_reader = SerialReader(self.serial_port, self.encoder_queue)
             self.serial_reader.start()
 
+            # Send motor config to firmware immediately after connecting
+            # so PPR and PID gains are set before any commands are sent.
+            self.root.after(200, self.send_all_config)
+
         except serial.SerialException as e:
             messagebox.showerror("Connection Error", f"Failed to open {device}:\n{e}")
             self.status_label.config(text="Status: Not connected")
@@ -734,7 +780,20 @@ class MotorControlGUI:
                 raw_value = latest[panel.motor_id]
                 motor_id  = panel.motor_id
 
-                if READING_MODE == READING_MODE_ABSOLUTE:
+                if READING_MODE == READING_MODE_RPM_X10:
+                    # Firmware has already calculated RPM*10 — no delta
+                    # or elapsed time calculation needed. Just convert
+                    # and pass to the panel for display.
+                    motor_shaft_rpm = raw_value / 10.0
+                    self._last_packet_time[motor_id] = latest_ts
+                    motor_key = str(motor_id)
+                    cfg = self.motor_config.get(
+                        motor_key, {"gear_ratio": DEFAULT_GEAR_RATIO,
+                                    "wheel_diameter_mm": 0.0})
+                    panel.update_rpm(motor_shaft_rpm, cfg["gear_ratio"],
+                                     cfg.get("wheel_diameter_mm", 0.0))
+
+                elif READING_MODE == READING_MODE_ABSOLUTE:
                     previous = self._last_raw_value[motor_id]
                     self._last_raw_value[motor_id] = raw_value
                     if previous is None:
@@ -745,21 +804,31 @@ class MotorControlGUI:
                         delta_counts -= RAW_VALUE_RANGE
                     elif delta_counts < -RAW_VALUE_RANGE // 2:
                         delta_counts += RAW_VALUE_RANGE
-                else:
+                    last_t = self._last_packet_time[motor_id]
+                    elapsed_sec = (latest_ts - last_t
+                                   if last_t is not None and latest_ts > last_t
+                                   else POLL_INTERVAL_SEC)
+                    self._last_packet_time[motor_id] = latest_ts
+                    motor_key = str(motor_id)
+                    cfg = self.motor_config.get(
+                        motor_key, {"ppr": DEFAULT_PPR,
+                                    "gear_ratio": DEFAULT_GEAR_RATIO})
+                    panel.update_encoder(delta_counts, cfg["ppr"],
+                                         cfg["gear_ratio"], elapsed_sec)
+
+                else:  # READING_MODE_DELTA
                     delta_counts = raw_value
-
-                last_t = self._last_packet_time[motor_id]
-                if last_t is not None and latest_ts > last_t:
-                    elapsed_sec = latest_ts - last_t
-                else:
-                    elapsed_sec = POLL_INTERVAL_SEC
-                self._last_packet_time[motor_id] = latest_ts
-
-                motor_key = str(motor_id)
-                cfg = self.motor_config.get(
-                    motor_key, {"ppr": DEFAULT_PPR, "gear_ratio": DEFAULT_GEAR_RATIO})
-                panel.update_encoder(delta_counts, cfg["ppr"], cfg["gear_ratio"],
-                                     elapsed_sec)
+                    last_t = self._last_packet_time[motor_id]
+                    elapsed_sec = (latest_ts - last_t
+                                   if last_t is not None and latest_ts > last_t
+                                   else POLL_INTERVAL_SEC)
+                    self._last_packet_time[motor_id] = latest_ts
+                    motor_key = str(motor_id)
+                    cfg = self.motor_config.get(
+                        motor_key, {"ppr": DEFAULT_PPR,
+                                    "gear_ratio": DEFAULT_GEAR_RATIO})
+                    panel.update_encoder(delta_counts, cfg["ppr"],
+                                         cfg["gear_ratio"], elapsed_sec)
 
         # Blank live RPM/direction for any motor that hasn't sent a
         # packet recently, so stale values aren't mistaken for current
@@ -781,30 +850,44 @@ class MotorControlGUI:
     # ------------------------------------------------------------------
 
     def send_command(self):
-
-        cdcdata = [3] + [0] * (2 * NUM_MOTORS)
-        #Byte 0 : [1]   enable motors 2 and 3
-        #         [0]   enable motors 0 and 1
-
-        #Byte 1 : [1]   M0 IN 2
-        #         [0]   M0 IN 1
-
-        #Byte 2 : [7:0] M0 PWM
-
-        ##repeats
+        # 12-byte command packet:
+        # Byte 0:  0x55 header
+        # Byte 1:  enable flags
+        # Byte 2:  M1 direction bits [bit0=IN1, bit1=IN2]
+        # Byte 3:  M1 PWM (0-255, manual mode)
+        # Byte 4:  M2 direction bits
+        # Byte 5:  M2 PWM (0-255, manual mode)
+        # Byte 6:  M1 PID enable (0/1)
+        # Byte 7:  M1 setpoint high byte } motor shaft RPM*10 as uint16
+        # Byte 8:  M1 setpoint low byte  }
+        # Byte 9:  M2 PID enable (0/1)
+        # Byte 10: M2 setpoint high byte
+        # Byte 11: M2 setpoint low byte
+        cdcdata = [0x55, 0x03] + [0] * 10
 
         for panel in self.motor_frames:
             motor_id  = panel.motor_id
             motor_in1 = panel.motor_in1
             motor_in2 = panel.motor_in2
             speed     = panel.motor_pwm
+            
+            print(f"M{motor_id}: in1={motor_in1} in2={motor_in2} pwm={speed}")  # <-- add this
 
-            if motor_in1 == 1:
-                cdcdata[(motor_id*2)-1] = cdcdata[(motor_id*2)-1] + 1
-            if motor_in2 == 1:
-                cdcdata[(motor_id*2)-1] = cdcdata[(motor_id*2)-1] + 2
+            dir_byte = (motor_in1 * 1) + (motor_in2 * 2)
+            cdcdata[motor_id * 2]       = dir_byte  # bytes 2, 4
+            cdcdata[(motor_id * 2) + 1] = speed     # bytes 3, 5
 
-            cdcdata[motor_id*2] = speed
+        # PID fields — placeholder zeros until PID controls are added
+        # Byte 6:  M1 PID enable
+        # Byte 7-8: M1 setpoint (RPM*10 as uint16, big-endian)
+        # Byte 9:  M2 PID enable
+        # Byte 10-11: M2 setpoint
+        cdcdata[6]  = 0    # M1 PID disabled
+        cdcdata[7]  = 0    # M1 setpoint high
+        cdcdata[8]  = 0    # M1 setpoint low
+        cdcdata[9]  = 0    # M2 PID disabled
+        cdcdata[10] = 0    # M2 setpoint high
+        cdcdata[11] = 0    # M2 setpoint low
 
         print(printHex(cdcdata))
 
@@ -822,6 +905,35 @@ class MotorControlGUI:
                 messagebox.showerror("Serial Error", f"Failed to send command:\n{e}")
         else:
             messagebox.showwarning("Not Connected", "Please connect to a USB CDC device first.")
+
+    def send_motor_config(self, motor_id):
+        """Send 20-byte config packet (0xBB header) for one motor.
+        Called on connect and whenever Settings are saved."""
+        motor_key = str(motor_id)
+        cfg = self.motor_config.get(motor_key, {})
+
+        packet = bytearray(20)
+        packet[0] = 0xBB
+        packet[1] = motor_id
+        struct.pack_into('<H', packet, 2,  int(cfg.get('ppr', DEFAULT_PPR)))
+        struct.pack_into('<f', packet, 4,  float(cfg.get('kp', 0.5)))
+        struct.pack_into('<f', packet, 8,  float(cfg.get('ki', 0.1)))
+        struct.pack_into('<f', packet, 12, float(cfg.get('kd', 0.05)))
+        struct.pack_into('<f', packet, 16, float(cfg.get('integral_limit', 255.0)))
+
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write(bytes(packet))
+                print(f"Config sent for motor {motor_id}: {printHex(packet)}")
+            except serial.SerialException as e:
+                messagebox.showerror("Serial Error",
+                                     f"Failed to send config:\n{e}")
+
+    def send_all_config(self):
+        """Send config for all motors — called on connect and settings save."""
+        for motor_id in range(1, NUM_MOTORS + 1):
+            self.send_motor_config(motor_id)
+            time.sleep(0.02)  # small gap so firmware can process each packet
 
     def on_close(self):
         self._stop_reader()

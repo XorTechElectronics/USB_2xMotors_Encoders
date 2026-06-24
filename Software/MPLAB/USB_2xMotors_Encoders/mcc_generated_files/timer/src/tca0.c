@@ -80,7 +80,7 @@ void TCA0_Initialize(void)
         | (0 << TCA_SPLIT_LCMP0_bp)   // LCMP0 disabled
         | (0 << TCA_SPLIT_LCMP1_bp)   // LCMP1 disabled
         | (0 << TCA_SPLIT_LCMP2_bp)   // LCMP2 disabled
-        | (0 << TCA_SPLIT_LUNF_bp);  // LUNF disabled
+        | (1 << TCA_SPLIT_LUNF_bp);  // LUNF enabled
 
     TCA0.SPLIT.INTFLAGS = (0 << TCA_SPLIT_HUNF_bp)   // HUNF disabled
         | (0 << TCA_SPLIT_LCMP0_bp)   // LCMP0 disabled
@@ -185,102 +185,34 @@ uint8_t TCA0_MaxCountGet(void)
     return TCA0_MAX_COUNT;
 }
 
-void TCA0_HUNFInterruptFlagClear(void)
+void TCA0_InterruptEnable(void)
 {
-    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_HUNF_bm; /* Clear High-Byte Underflow Interrupt Flag */
+    TCA0.SPLIT.INTCTRL = (1 << TCA_SPLIT_HUNF_bp) /* High Underflow Interrupt Enable: enabled */
+	                | (1 << TCA_SPLIT_LCMP0_bp) /* Low Compare 0 Interrupt Enable: enabled */
+	                | (1 << TCA_SPLIT_LCMP1_bp) /* Low Compare 1 Interrupt Enable: enabled */
+	                | (1 << TCA_SPLIT_LCMP2_bp) /* Low Compare 2 Interrupt Enable: enabled */
+	                | (1 << TCA_SPLIT_LUNF_bp); /* Low Underflow Interrupt Enable: enabled */
 }
 
-bool TCA0_HUNFInterruptStatusGet(void)
+void TCA0_InterruptDisable(void)
 {
-    return ((TCA0.SPLIT.INTFLAGS & TCA_SPLIT_HUNF_bm) > 0);
+    TCA0.SPLIT.INTCTRL = (0 << TCA_SPLIT_HUNF_bp)    /* High Underflow Interrupt Enable: disabled */
+	                | (0 << TCA_SPLIT_LCMP0_bp) /* Low Compare 0 Interrupt Enable: disabled */
+	                | (0 << TCA_SPLIT_LCMP1_bp) /* Low Compare 1 Interrupt Enable: disabled */
+	                | (0 << TCA_SPLIT_LCMP2_bp) /* Low Compare 2 Interrupt Enable: disabled */
+	                | (0 << TCA_SPLIT_LUNF_bp); /* Low Underflow Interrupt Enable: disabled */
 }
 
-void TCA0_LUNFInterruptFlagClear(void)
+/* cppcheck-suppress misra-c2012-2.7 */
+/* cppcheck-suppress misra-c2012-8.2 */
+/* cppcheck-suppress misra-c2012-8.4 */
+ISR(TCA0_LUNF_vect)
 {
-    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LUNF_bm; /* Clear Low-Byte Underflow Interrupt Flag */
-}
-
-bool TCA0_LUNFInterruptStatusGet(void)
-{
-    return ((TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LUNF_bm) > 0);
-}
-
-void TCA0_LCMP0InterruptFlagClear(void)
-{
-    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP0_bm; /* Clear Low-Byte Compare Channel-0 Interrupt Flag */
-}
-
-bool TCA0_LCMP0InterruptStatusGet(void)
-{
-    return ((TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP0_bm) > 0);
-}
-
-void TCA0_LCMP1InterruptFlagClear(void)
-{
-    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP1_bm; /* Clear Low-Byte Compare Channel-1 Interrupt Flag */
-}
-
-bool TCA0_LCMP1InterruptStatusGet(void)
-{
-    return ((TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP1_bm) > 0);
-}
-
-void TCA0_LCMP2InterruptFlagClear(void)
-{
-    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP2_bm; /* Clear Low-Byte Compare Channel-2 Interrupt Flag */
-}
-
-bool TCA0_LCMP2InterruptStatusGet(void)
-{
-    return ((TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP2_bm) > 0);
-}
-
-void TCA0_Tasks(void)
-{
-    if(0 != (TCA0.SPLIT.INTFLAGS & TCA_SPLIT_HUNF_bm))
+    if(NULL != TCA0_LCNT_Callback)
     {
-        if(NULL != TCA0_HCNT_Callback)
-        {
-            (*TCA0_HCNT_Callback)();
-        }
-        TCA0.SPLIT.INTFLAGS = TCA_SPLIT_HUNF_bm;
+        (*TCA0_LCNT_Callback)();
     }
-    
-    if(0 != (TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP0_bm))
-    {
-        if(NULL != TCA0_LCMP0_Callback)
-        {
-            (*TCA0_LCMP0_Callback)();
-        }
-        TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP0_bm;
-    }
-    
-    if(0 != (TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP1_bm))
-    {
-        if(NULL != TCA0_LCMP1_Callback)
-        {
-            (*TCA0_LCMP1_Callback)();
-        }
-        TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP1_bm;
-    }
-    
-    if(0 != (TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LCMP2_bm))
-    {
-        if(NULL != TCA0_LCMP2_Callback)
-        {
-            (*TCA0_LCMP2_Callback)();
-        }
-        TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LCMP2_bm;
-    }
-    
-    if(0 != (TCA0.SPLIT.INTFLAGS & TCA_SPLIT_LUNF_bm))
-    {
-         if(NULL != TCA0_LCNT_Callback)
-        {
-            (*TCA0_LCNT_Callback)();
-        }
-        TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LUNF_bm;
-    }
+    TCA0.SPLIT.INTFLAGS = TCA_SPLIT_LUNF_bm;
 }
 
 void TCA0_HighCountCallbackRegister(TCA0_cb_t CallbackHandler)
