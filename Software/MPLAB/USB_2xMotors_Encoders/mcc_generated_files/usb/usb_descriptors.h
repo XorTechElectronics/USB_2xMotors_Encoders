@@ -52,14 +52,14 @@
  * @def STRING_MANUFACTURER
  * @brief Manufacturer String descriptor.
  */
-#define STRING_MANUFACTURER L"Microchip Technology Inc."
+#define STRING_MANUFACTURER L"XorTech."
 
 /**
  * @ingroup usb_device_stack
  * @def STRING_PRODUCT
  * @brief Product String descriptor.
  */
-#define STRING_PRODUCT      L"CDC Class Demo"
+#define STRING_PRODUCT      L"2 Motors with Encoders CDC Controller"
 
 /**
  * @ingroup usb_device_stack

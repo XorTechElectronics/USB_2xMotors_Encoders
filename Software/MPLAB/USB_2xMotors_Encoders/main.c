@@ -34,6 +34,7 @@
 */
 #include "mcc_generated_files/system/system.h"
 
+#include <math.h>
 #include <stdio.h>
 #include "string.h"
 
@@ -41,6 +42,9 @@
 #include "usb_cdc_virtual_serial_port.h"
 
 #include "../timer/delay.h"
+
+// Each encoder tick fires 4 interrupt on each edge of encA
+    #define QUADRATURE_DECODE  4   // 4x decoding: both edges, both channels
 
 // Packet Sizing from the Host to set settings or commands
     #define CMD_PACKET_SIZE     12
@@ -222,16 +226,28 @@
         bool pid0_was_enabled = pid[0].enabled;
         bool pid1_was_enabled = pid[1].enabled;        
 
-        // PID enable and setpoints
+        // Motor 1 Enable
         pid[0].enabled      = buf[6];
-        pid[0].setpoint_rpm = (float)((buf[7] << 8) | buf[8]) / 10.0f;
 
+        // Motor 2 Enable
         pid[1].enabled      = buf[9];
-        pid[1].setpoint_rpm = (float)((buf[10] << 8) | buf[11]) / 10.0f;
+               
+        //Setpoints
+        // Cast to uint16_t before shifting ? on 8-bit AVR, uint8_t << 8 overflows to 0
+        pid[0].setpoint_rpm = (float)(((uint16_t)buf[7]  << 8) | buf[8])  / 10.0f;
+        pid[1].setpoint_rpm = (float)(((uint16_t)buf[10] << 8) | buf[11]) / 10.0f;        
+        
+        
+        
 
         // Only zero PWM if PID just transitioned from enabled -> disabled
         if (pid0_was_enabled && !pid[0].enabled) { TCA0.SPLIT.LCMP1 = 0; pid[0].integral = 0.0f; }
         if (pid1_was_enabled && !pid[1].enabled) { TCA0.SPLIT.LCMP0 = 0; pid[1].integral = 0.0f; }
+        
+        
+        //Debug...
+        UART_PrintString("M2 PID:"); UART_PrintLong((int32_t)buf[9]);
+        UART_PrintString("M2 SP:");  UART_PrintLong((int32_t)((buf[10] << 8) | buf[11]));        
     }    
     
     void ProcessConfigPacket(uint8_t *buf) {
@@ -260,6 +276,15 @@
         pid[idx].ki             = motor_config[idx].ki;
         pid[idx].kd             = motor_config[idx].kd;
         pid[idx].integral_limit = motor_config[idx].integral_limit;
+        
+        
+        // UART dump to confirm received values
+        UART_PrintLong((int32_t)motor_id);
+        UART_PrintLong((int32_t)motor_config[idx].ppr);
+        UART_PrintLong((int32_t)(motor_config[idx].kp * 1000));   // *1000 to see 3dp as integer
+        UART_PrintLong((int32_t)(motor_config[idx].ki * 1000));
+        UART_PrintLong((int32_t)(motor_config[idx].kd * 1000));
+        UART_PrintLong((int32_t)motor_config[idx].integral_limit);        
     }    
     
     
@@ -316,7 +341,12 @@
         while (!USART0_IsTxReady());
         USART0_Write(byte);
     }    
-    
+ 
+    void UART_PrintString(const char *s) {
+        while (*s) UART_WriteByte((uint8_t)*s++);
+        //UART_WriteByte('\r');
+        //UART_WriteByte('\n');
+    }    
     
     void UART_PrintLong(int32_t value) {
         char buf[12];
@@ -369,13 +399,80 @@
         // With PPR=56: RPM*10 = counts * 6000 / 56 = counts * 107.14
         // Use integer maths: (counts * 6000) / PPR
 
-        motor1_rpm_x10 = ((long)m1_delta * 6000L) / motor_config[0].ppr;
-        motor2_rpm_x10 = ((long)m2_delta * 6000L) / motor_config[1].ppr;
+        motor1_rpm_x10 = ((long)m1_delta * 6000L) / ( motor_config[0].ppr * QUADRATURE_DECODE );
+        motor2_rpm_x10 = ((long)m2_delta * 6000L) / ( motor_config[1].ppr * QUADRATURE_DECODE );
         
-        //UART_PrintLong(RPM_WINDOW_TICKS);
-        //UART_PrintLong(m1_delta);  // raw count snapshot before RPM calc    
+        // PID uses actual RPM (not ×10), unsigned magnitude
+        float m1_rpm = fabsf((float)motor1_rpm_x10 / 10.0f);
+        float m2_rpm = fabsf((float)motor2_rpm_x10 / 10.0f);
+
+        Calculate_PID(&pid[0], m1_rpm, 0);
+        Calculate_PID(&pid[1], m2_rpm, 1);  
     }    
     
+//##############################################################################    
+//PID Calculations
+//##############################################################################    
+void Calculate_PID(PID_t *pid, float measured_rpm, uint8_t motor_idx)
+{
+    if (!pid->enabled || pid->setpoint_rpm <= 0.0f)
+    {
+        pid->integral   = 0.0f;
+        pid->prev_error = 0.0f;
+        return;
+    }
+
+    float error      = pid->setpoint_rpm - measured_rpm;
+    pid->integral   += error * 0.1f;
+
+    if (pid->integral >  pid->integral_limit) pid->integral =  pid->integral_limit;
+    if (pid->integral < -pid->integral_limit) pid->integral = -pid->integral_limit;
+
+    float derivative = (error - pid->prev_error) / 0.1f;
+    pid->prev_error  = error;
+
+    float output = (pid->kp * error) +
+                   (pid->ki * pid->integral) +
+                   (pid->kd * derivative);
+
+    if (output < 0.0f)   output = 0.0f;
+    if (output > 255.0f) output = 255.0f;
+
+    // Rate limit PWM change per 100ms window to prevent bang-bang behaviour
+    #define MAX_PWM_STEP  10
+
+    int16_t current_pwm = (motor_idx == 0) ? TCA0.SPLIT.LCMP1 : TCA0.SPLIT.LCMP0;
+    int16_t new_pwm     = (int16_t)output;
+
+    if (new_pwm - current_pwm >  MAX_PWM_STEP) new_pwm = current_pwm + MAX_PWM_STEP;
+    if (new_pwm - current_pwm < -MAX_PWM_STEP) new_pwm = current_pwm - MAX_PWM_STEP;
+
+    pid->pwm_output = (uint8_t)new_pwm;
+
+    // Temp debug
+    //UART_PrintString("=== PID DEBUG ===");
+    //UART_PrintString("Setpoint:");  UART_PrintLong((int32_t)pid->setpoint_rpm);
+    //UART_PrintString("Measured:");  UART_PrintLong((int32_t)measured_rpm);
+    //UART_PrintString("Ki*10000:");  UART_PrintLong((int32_t)(pid->ki * 10000));
+    //UART_PrintString("Integ*100:"); UART_PrintLong((int32_t)(pid->integral * 100));
+    //UART_PrintString("PWM:");       UART_PrintLong((int32_t)new_pwm);
+    //UART_PrintString("---");
+
+    if (motor_idx == 0) TCA0.SPLIT.LCMP1 = pid->pwm_output;
+    if (motor_idx == 1) TCA0.SPLIT.LCMP0 = pid->pwm_output;
+    
+    
+    
+if (motor_idx == 1)
+{
+    UART_PrintString("\r\nM2:");
+    UART_PrintString("\r\nSP:");    UART_PrintLong((int32_t)pid->setpoint_rpm);
+    UART_PrintString("\r\nRPM:");   UART_PrintLong((int32_t)measured_rpm);
+    UART_PrintString("\r\nInteg:"); UART_PrintLong((int32_t)(pid->integral));
+    UART_PrintString("\r\nPWM:");   UART_PrintLong((int32_t)new_pwm);
+}    
+    
+}   
     
 //##############################################################################    
 //##############################################################################    
