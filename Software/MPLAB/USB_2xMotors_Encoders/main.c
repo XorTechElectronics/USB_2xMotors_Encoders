@@ -48,7 +48,7 @@
 
 // Packet Sizing from the Host to set settings or commands
     #define CMD_PACKET_SIZE     12
-    #define CONFIG_PACKET_SIZE  20
+    #define CONFIG_PACKET_SIZE  22
 
 // TCA0 underflow timebase for RPM calculation
 // At 24MHz / prescaler 4 / 256 counts = 23,437 Hz overflow rate
@@ -121,6 +121,8 @@
         float    ki;
         float    kd;
         float    integral_limit;
+        uint8_t  max_pwm_step;
+        bool     debug_enabled;
     } MotorConfig_t;
 
     MotorConfig_t motor_config[2];
@@ -259,10 +261,8 @@
         // buf[12-15] = Kd as float
         // buf[16-19] = integral limit as float
 
-        uint8_t motor_id = buf[1];
-        
-        if (motor_id < 1 || motor_id > 2) return;
-        
+        uint8_t motor_id = buf[1];        
+        if (motor_id < 1 || motor_id > 2) return;        
         uint8_t idx = motor_id - 1;
 
         memcpy(&motor_config[idx].ppr,            &buf[2],  sizeof(uint16_t));
@@ -270,6 +270,8 @@
         memcpy(&motor_config[idx].ki,             &buf[8],  sizeof(float));
         memcpy(&motor_config[idx].kd,             &buf[12], sizeof(float));
         memcpy(&motor_config[idx].integral_limit, &buf[16], sizeof(float));
+        motor_config[idx].max_pwm_step          =  buf[20];
+        motor_config[idx].debug_enabled         = (buf[21] != 0);
 
         // Update live PID gains immediately
         pid[idx].kp             = motor_config[idx].kp;
@@ -279,12 +281,15 @@
         
         
         // UART dump to confirm received values
+        UART_PrintString("Config Motor:");
         UART_PrintLong((int32_t)motor_id);
-        UART_PrintLong((int32_t)motor_config[idx].ppr);
-        UART_PrintLong((int32_t)(motor_config[idx].kp * 1000));   // *1000 to see 3dp as integer
-        UART_PrintLong((int32_t)(motor_config[idx].ki * 1000));
-        UART_PrintLong((int32_t)(motor_config[idx].kd * 1000));
-        UART_PrintLong((int32_t)motor_config[idx].integral_limit);        
+        UART_PrintString("PPR:");       UART_PrintLong((int32_t) motor_config[idx].ppr);
+        UART_PrintString("Kp*1000:");   UART_PrintLong((int32_t)(motor_config[idx].kp * 1000));
+        UART_PrintString("Ki*1000:");   UART_PrintLong((int32_t)(motor_config[idx].ki * 1000));
+        UART_PrintString("Kd*1000:");   UART_PrintLong((int32_t)(motor_config[idx].kd * 1000));
+        UART_PrintString("Limit:");     UART_PrintLong((int32_t) motor_config[idx].integral_limit);
+        UART_PrintString("Step:");      UART_PrintLong((int32_t) motor_config[idx].max_pwm_step);
+        UART_PrintString("Debug:");     UART_PrintLong((int32_t) motor_config[idx].debug_enabled);        
     }    
     
     
@@ -331,6 +336,25 @@
         for (int i = 0; i < 5; i++)
         {
             USB_CDCWrite(packet[i]);
+        }
+    }    
+    
+    void SendPIDDebugBinary(uint8_t motor_id,   float setpoint, float measured,
+                            float error,        float p_term,   float i_term,
+                            float d_term,       uint8_t pwm ) {
+        uint8_t packet[27];
+        packet[0] = 0xBB;
+        packet[1] = motor_id;
+        memcpy(&packet[2],  &setpoint, sizeof(float));
+        memcpy(&packet[6],  &measured, sizeof(float));
+        memcpy(&packet[10], &error,    sizeof(float));
+        memcpy(&packet[14], &p_term,   sizeof(float));
+        memcpy(&packet[18], &i_term,   sizeof(float));
+        memcpy(&packet[22], &d_term,   sizeof(float));
+        packet[26] = pwm;
+
+        for (int i = 0; i < 27; i++) {
+            if (USB_CDCWrite(packet[i]) == CDC_BUFFER_FULL) { }
         }
     }    
   
@@ -413,42 +437,55 @@
 //##############################################################################    
 //PID Calculations
 //##############################################################################    
-void Calculate_PID(PID_t *pid, float measured_rpm, uint8_t motor_idx)
-{
-    if (!pid->enabled || pid->setpoint_rpm <= 0.0f)
-    {
-        pid->integral   = 0.0f;
-        pid->prev_error = 0.0f;
-        return;
-    }
+    void Calculate_PID(PID_t *pid, float measured_rpm, uint8_t motor_idx) {
+        if (!pid->enabled || pid->setpoint_rpm <= 0.0f) {
+            pid->integral   = 0.0f;
+            pid->prev_error = 0.0f;
+            return;
+        }
 
-    float error      = pid->setpoint_rpm - measured_rpm;
-    pid->integral   += error * 0.1f;
+        float error      = pid->setpoint_rpm - measured_rpm;
+        pid->integral   += error * 0.1f;
 
-    if (pid->integral >  pid->integral_limit) pid->integral =  pid->integral_limit;
-    if (pid->integral < -pid->integral_limit) pid->integral = -pid->integral_limit;
+        if (pid->integral >  pid->integral_limit) pid->integral =  pid->integral_limit;
+        if (pid->integral < -pid->integral_limit) pid->integral = -pid->integral_limit;
 
-    float derivative = (error - pid->prev_error) / 0.1f;
-    pid->prev_error  = error;
+        float derivative = (error - pid->prev_error) / 0.1f;
+        pid->prev_error  = error;
 
-    float output = (pid->kp * error) +
-                   (pid->ki * pid->integral) +
-                   (pid->kd * derivative);
+        float p_term = pid->kp * error;
+        float i_term = pid->ki * pid->integral;
+        float d_term = pid->kd * derivative;
+        float output = p_term + i_term + d_term;
 
-    if (output < 0.0f)   output = 0.0f;
-    if (output > 255.0f) output = 255.0f;
+        if (output < 0.0f)   output = 0.0f;
+        if (output > 255.0f) output = 255.0f;
 
-    // Rate limit PWM change per 100ms window to prevent bang-bang behaviour
-    #define MAX_PWM_STEP  10
+        // Rate limit PWM change per 100ms
+        int16_t current_pwm = (motor_idx == 0) ? TCA0.SPLIT.LCMP1 : TCA0.SPLIT.LCMP0;
+        int16_t new_pwm     = (int16_t)output;
+        uint8_t step        = motor_config[motor_idx].max_pwm_step;
+        
+        if (new_pwm - current_pwm >  (int16_t)step) new_pwm = current_pwm + step;
+        if (new_pwm - current_pwm < -(int16_t)step) new_pwm = current_pwm - step;
 
-    int16_t current_pwm = (motor_idx == 0) ? TCA0.SPLIT.LCMP1 : TCA0.SPLIT.LCMP0;
-    int16_t new_pwm     = (int16_t)output;
+        pid->pwm_output = (uint8_t)new_pwm;
 
-    if (new_pwm - current_pwm >  MAX_PWM_STEP) new_pwm = current_pwm + MAX_PWM_STEP;
-    if (new_pwm - current_pwm < -MAX_PWM_STEP) new_pwm = current_pwm - MAX_PWM_STEP;
+        if (motor_idx == 0) TCA0.SPLIT.LCMP1 = pid->pwm_output;
+        if (motor_idx == 1) TCA0.SPLIT.LCMP0 = pid->pwm_output;
 
-    pid->pwm_output = (uint8_t)new_pwm;
-
+        // Send debug packet if enabled for this motor
+        if (motor_config[motor_idx].debug_enabled) {
+            SendPIDDebugBinary( motor_idx + 1,         // motor_id 1-based
+                                pid->setpoint_rpm,
+                                measured_rpm,
+                                error,
+                                p_term,
+                                i_term,
+                                d_term,
+                                pid->pwm_output);
+        }
+    
     // Temp debug
     //UART_PrintString("=== PID DEBUG ===");
     //UART_PrintString("Setpoint:");  UART_PrintLong((int32_t)pid->setpoint_rpm);
@@ -456,23 +493,10 @@ void Calculate_PID(PID_t *pid, float measured_rpm, uint8_t motor_idx)
     //UART_PrintString("Ki*10000:");  UART_PrintLong((int32_t)(pid->ki * 10000));
     //UART_PrintString("Integ*100:"); UART_PrintLong((int32_t)(pid->integral * 100));
     //UART_PrintString("PWM:");       UART_PrintLong((int32_t)new_pwm);
-    //UART_PrintString("---");
+    //UART_PrintString("---");    
+}
 
-    if (motor_idx == 0) TCA0.SPLIT.LCMP1 = pid->pwm_output;
-    if (motor_idx == 1) TCA0.SPLIT.LCMP0 = pid->pwm_output;
-    
-    
-    
-if (motor_idx == 1)
-{
-    UART_PrintString("\r\nM2:");
-    UART_PrintString("\r\nSP:");    UART_PrintLong((int32_t)pid->setpoint_rpm);
-    UART_PrintString("\r\nRPM:");   UART_PrintLong((int32_t)measured_rpm);
-    UART_PrintString("\r\nInteg:"); UART_PrintLong((int32_t)(pid->integral));
-    UART_PrintString("\r\nPWM:");   UART_PrintLong((int32_t)new_pwm);
-}    
-    
-}   
+
     
 //##############################################################################    
 //##############################################################################    
@@ -493,6 +517,8 @@ int main(void) {
         motor_config[i].ki             = 0.0f;
         motor_config[i].kd             = 0.0f;
         motor_config[i].integral_limit = 255.0f;
+        motor_config[i].max_pwm_step   = 10;
+        motor_config[i].debug_enabled  = false;
 
         pid[i].kp             = 0.0f;
         pid[i].ki             = 0.0f;

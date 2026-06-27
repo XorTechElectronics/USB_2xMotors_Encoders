@@ -82,6 +82,8 @@ DEFAULT_KP               = 0.5
 DEFAULT_KI               = 0.1
 DEFAULT_KD               = 0.05
 DEFAULT_INTEGRAL_LIMIT   = 255.0
+DEFAULT_MAX_PWM_STEP     = 10
+DEFAULT_DEBUG_ENABLED    = False
 
 
 def default_motor_config():
@@ -95,6 +97,8 @@ def default_motor_config():
             "ki":                DEFAULT_KI,
             "kd":                DEFAULT_KD,
             "integral_limit":    DEFAULT_INTEGRAL_LIMIT,
+            "max_pwm_step":      DEFAULT_MAX_PWM_STEP,
+            "debug_enabled":     DEFAULT_DEBUG_ENABLED,
         }
         for m in range(1, NUM_MOTORS + 1)
     }
@@ -134,6 +138,8 @@ def load_motor_config():
                 "ki":                _coerce_nonneg  (entry.get("ki"),                defaults["ki"]),
                 "kd":                _coerce_nonneg  (entry.get("kd"),                defaults["kd"]),
                 "integral_limit":    _coerce_positive(entry.get("integral_limit"),    defaults["integral_limit"]),
+                "max_pwm_step":      int(_coerce_positive(entry.get("max_pwm_step"),  defaults["max_pwm_step"])),
+                "debug_enabled":     bool(entry.get("debug_enabled",                  defaults["debug_enabled"])),
             }
     except (json.JSONDecodeError, OSError):
         pass
@@ -153,13 +159,18 @@ def save_motor_config(config):
 # Serial reader thread
 # ----------------------------------------------------------------------
 
+DEBUG_HEADER      = 0xBB
+DEBUG_PACKET_SIZE = 27  # 0xBB + motor_id + 6×float + uint8 pwm
+
+
 class SerialReader(threading.Thread):
-    def __init__(self, serial_port, data_queue):
+    def __init__(self, serial_port, data_queue, debug_queues=None):
         super().__init__(daemon=True)
-        self.serial_port = serial_port
-        self.data_queue = data_queue
-        self._stop_event = threading.Event()
-        self._buffer = bytearray()
+        self.serial_port  = serial_port
+        self.data_queue   = data_queue
+        self.debug_queues = debug_queues or {}  # {motor_id: queue.Queue}
+        self._stop_event  = threading.Event()
+        self._buffer      = bytearray()
 
     def stop(self):
         self._stop_event.set()
@@ -185,22 +196,70 @@ class SerialReader(threading.Thread):
 
     def _try_parse_packets(self):
         while True:
-            header_index = self._buffer.find(bytes([ENCODER_HEADER]))
-            if header_index == -1:
+            if not self._buffer:
+                return
+
+            # Look for either known header
+            aa_idx = self._buffer.find(bytes([ENCODER_HEADER]))
+            bb_idx = self._buffer.find(bytes([DEBUG_HEADER]))
+
+            # Find the nearest valid header
+            if aa_idx == -1 and bb_idx == -1:
                 self._buffer.clear()
                 return
-            if header_index > 0:
-                del self._buffer[:header_index]
-            if len(self._buffer) < ENCODER_PACKET_SIZE:
-                return
-            packet = bytes(self._buffer[:ENCODER_PACKET_SIZE])
-            del self._buffer[:ENCODER_PACKET_SIZE]
-            try:
-                values = struct.unpack(f'<{NUM_MOTORS}l', packet[1:])
-            except struct.error:
-                continue
-            encoder_values = {m: values[m - 1] for m in range(1, NUM_MOTORS + 1)}
-            self.data_queue.put((time.monotonic(), encoder_values))
+
+            if aa_idx == -1:
+                next_idx = bb_idx
+            elif bb_idx == -1:
+                next_idx = aa_idx
+            else:
+                next_idx = min(aa_idx, bb_idx)
+
+            # Discard garbage bytes before the header
+            if next_idx > 0:
+                del self._buffer[:next_idx]
+
+            header = self._buffer[0]
+
+            if header == ENCODER_HEADER:
+                if len(self._buffer) < ENCODER_PACKET_SIZE:
+                    return
+                packet = bytes(self._buffer[:ENCODER_PACKET_SIZE])
+                del self._buffer[:ENCODER_PACKET_SIZE]
+                try:
+                    values = struct.unpack(f'<{NUM_MOTORS}l', packet[1:])
+                except struct.error:
+                    continue
+                encoder_values = {m: values[m - 1] for m in range(1, NUM_MOTORS + 1)}
+                self.data_queue.put((time.monotonic(), encoder_values))
+
+            elif header == DEBUG_HEADER:
+                if len(self._buffer) < DEBUG_PACKET_SIZE:
+                    return
+                packet = bytes(self._buffer[:DEBUG_PACKET_SIZE])
+                del self._buffer[:DEBUG_PACKET_SIZE]
+                try:
+                    motor_id = packet[1]
+                    setpoint, measured, error, p_term, i_term, d_term = \
+                        struct.unpack('<6f', packet[2:26])
+                    pwm = packet[26]
+                    debug_data = {
+                        "motor_id": motor_id,
+                        "setpoint": setpoint,
+                        "measured": measured,
+                        "error":    error,
+                        "p_term":   p_term,
+                        "i_term":   i_term,
+                        "d_term":   d_term,
+                        "pwm":      pwm,
+                    }
+                    if motor_id in self.debug_queues:
+                        self.debug_queues[motor_id].put(debug_data)
+                except struct.error:
+                    continue
+            else:
+                # Unknown header byte — discard and keep scanning
+                del self._buffer[:1]
 
 
 # ----------------------------------------------------------------------
@@ -221,10 +280,12 @@ class MotorControlPanel(ttk.LabelFrame):
 
     RPM_WINDOW_SIZE = 20  # ~2 seconds of smoothing at 10Hz
 
-    def __init__(self, parent, motor_id, send_command_cb):
+    def __init__(self, parent, motor_id, send_command_cb, send_config_cb=None):
         super().__init__(parent, text=f"Motor {motor_id}")
         self.motor_id     = motor_id
         self.send_command = send_command_cb
+        self.send_config  = send_config_cb  # GUI's send_motor_config(motor_id, debug)
+        self.debug_queue  = queue.Queue()   # receives PID debug packets from SerialReader
 
         # Motor state
         self.motor_in1 = 0
@@ -389,6 +450,19 @@ class MotorControlPanel(ttk.LabelFrame):
         ttk.Label(self, textvariable=self.vel_hint_var, foreground="gray").grid(
             row=row, column=0, columnspan=CC, padx=6, pady=(0, 4))
         row += 1
+
+        # ── PID Tuning ───────────────────────────────────────────────
+        ttk.Separator(self, orient="horizontal").grid(
+            row=row, column=0, columnspan=CC, sticky="ew", pady=(4, 4))
+        row += 1
+
+        self.btn_pid_tune = ttk.Button(
+            self, text=f"⚙ PID Tuning — Motor {self.motor_id}",
+            command=self._open_pid_tuning)
+        self.btn_pid_tune.grid(
+            row=row, column=0, columnspan=CC, padx=6, pady=(0, 4), sticky="ew")
+        row += 1
+        self._pid_tuning_window = None
 
         # ── Cumulative distance + reset ───────────────────────────────
         ttk.Separator(self, orient="horizontal").grid(
@@ -557,11 +631,11 @@ class MotorControlPanel(ttk.LabelFrame):
     def _on_output_sp_slider(self, val):
         v = round(float(val), 1)
         self.output_sp_entry_var.set(f"{v:.1f}")
-        if not self.output_pid_enabled:
-            self.output_pid_enabled   = True
+        self.output_sp_var.set(v)
+        if self.output_pid_enabled:
             self.velocity_pid_enabled = False
-        self._update_pid_buttons()
-        self.send_command()
+            self._update_pid_buttons()
+            self.send_command()
 
     def _on_output_sp_entry(self, event=None):
         try:
@@ -569,22 +643,21 @@ class MotorControlPanel(ttk.LabelFrame):
             v = max(0.0, min(v, self.output_sp_slider.cget("to")))
             self.output_sp_entry_var.set(f"{v:.1f}")
             self.output_sp_var.set(v)
-            if not self.output_pid_enabled:
-                self.output_pid_enabled   = True
+            if self.output_pid_enabled:
                 self.velocity_pid_enabled = False
-            self._update_pid_buttons()
-            self.send_command()
+                self._update_pid_buttons()
+                self.send_command()
         except ValueError:
             pass
 
     def _on_vel_sp_slider(self, val):
         v = float(val)
         self.vel_sp_entry_var.set(f"{v:.3f}")
-        if not self.velocity_pid_enabled:
-            self.velocity_pid_enabled = True
-            self.output_pid_enabled   = False
-        self._update_pid_buttons()
-        self.send_command()
+        self.vel_sp_var.set(v)
+        if self.velocity_pid_enabled:
+            self.output_pid_enabled = False
+            self._update_pid_buttons()
+            self.send_command()
 
     def _on_vel_sp_entry(self, event=None):
         try:
@@ -592,11 +665,10 @@ class MotorControlPanel(ttk.LabelFrame):
             v = max(0.0, min(v, self.vel_sp_slider.cget("to")))
             self.vel_sp_entry_var.set(f"{v:.3f}")
             self.vel_sp_var.set(v)
-            if not self.velocity_pid_enabled:
-                self.velocity_pid_enabled = True
-                self.output_pid_enabled   = False
-            self._update_pid_buttons()
-            self.send_command()
+            if self.velocity_pid_enabled:
+                self.output_pid_enabled = False
+                self._update_pid_buttons()
+                self.send_command()
         except ValueError:
             pass
 
@@ -621,6 +693,16 @@ class MotorControlPanel(ttk.LabelFrame):
             self.motor_pwm = 128
         self._update_pid_buttons()
         self.send_command()
+
+    def _open_pid_tuning(self):
+        """Open (or refocus) the PID tuning window for this motor."""
+        if (self._pid_tuning_window is not None and
+                self._pid_tuning_window.winfo_exists()):
+            self._pid_tuning_window.lift()
+            self._pid_tuning_window.focus_set()
+            return
+        self._pid_tuning_window = PIDTuningWindow(
+            self.winfo_toplevel(), self)
 
     def _update_pid_buttons(self):
         # Output PID button — green when active
@@ -745,16 +827,539 @@ class MotorControlPanel(ttk.LabelFrame):
 # Settings window
 # ----------------------------------------------------------------------
 
+class Sparkline(tk.Canvas):
+    """Simple canvas-based sparkline for error history.
+    Red above zero (positive error), blue below (negative error),
+    dashed grey zero line. Works on Windows and Pi with no extra libs."""
+
+    def __init__(self, parent, width=280, height=55, **kwargs):
+        super().__init__(parent, width=width, height=height,
+                         bg="#1e1e1e", highlightthickness=1,
+                         highlightbackground="#444", **kwargs)
+        self.w = width
+        self.h = height
+
+    def update(self, values):
+        self.delete("all")
+        if len(values) < 2:
+            return
+        mid = self.h // 2
+        # Zero line
+        self.create_line(0, mid, self.w, mid,
+                         fill="#555", dash=(3, 4))
+        scale = max(abs(v) for v in values)
+        if scale == 0:
+            self.create_text(self.w // 2, mid, text="stable",
+                             fill="#888", font=("TkDefaultFont", 8))
+            return
+        n = len(values)
+        pts = []
+        for i, v in enumerate(values):
+            x = int(i / (n - 1) * (self.w - 2)) + 1
+            y = int(mid - (v / scale) * (mid - 4))
+            y = max(2, min(self.h - 2, y))
+            pts.extend([x, y])
+
+        for i in range(0, len(pts) - 2, 2):
+            x1, y1 = pts[i],   pts[i + 1]
+            x2, y2 = pts[i + 2], pts[i + 3]
+            v = values[i // 2]
+            colour = "#cc4444" if v > 0 else ("#4488cc" if v < 0 else "#888")
+            self.create_line(x1, y1, x2, y2, fill=colour, width=2)
+
+
+class PIDTuningWindow(tk.Toplevel):
+    """
+    Per-motor PID tuning window showing:
+    - Editable Kp/Ki/Kd/Integral Limit/PWM Slew Rate with explicit Apply
+    - Live PID state from firmware debug packets (setpoint, measured, error)
+    - P/I/D contribution bars showing what's driving PWM
+    - 50-sample error sparkline
+    - Suggestion engine based on recent history
+    - Debug enable/disable (sends via config packet byte 20/21)
+    """
+
+    HISTORY_SIZE = 50  # ~5 seconds at 10Hz
+
+    def __init__(self, parent, panel):
+        super().__init__(parent)
+        self.panel  = panel
+        self.title(f"PID Tuning — Motor {panel.motor_id}")
+        self.resizable(False, False)
+        self.transient(parent)
+
+        # History for suggestion engine
+        self._history  = []
+        self._run_start = None  # list of dicts from debug packets
+
+        self._build_ui()
+        self._enable_debug(True)
+
+        # Poll debug queue
+        self.after(100, self._poll_debug_queue)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 4}
+        container = ttk.Frame(self, padding=10)
+        container.pack(fill="both", expand=True)
+
+        # ── Gains ─────────────────────────────────────────────────────
+        gains_frame = ttk.LabelFrame(container, text="Gains")
+        gains_frame.pack(fill="x", **pad)
+
+        cfg = self.panel.cfg
+        motor_key = str(self.panel.motor_id)
+
+        fields = [
+            ("Kp",             "kp",             "0.05"),
+            ("Ki",             "ki",             "0.02"),
+            ("Kd",             "kd",             "0.00"),
+            ("Integral Limit", "integral_limit", "10000"),
+            ("PWM Slew Rate",  "max_pwm_step",   "10"),
+        ]
+
+        self._gain_vars = {}
+        for col, (label, key, fallback) in enumerate(fields):
+            ttk.Label(gains_frame, text=label, anchor="center").grid(
+                row=0, column=col, padx=6, pady=(4, 0), sticky="ew")
+            val = self.panel.cfg.get(key, fallback)
+            var = tk.StringVar(value=f"{val:g}" if isinstance(val, (int, float)) else str(val))
+            ttk.Entry(gains_frame, textvariable=var, width=8,
+                      justify="center").grid(
+                row=1, column=col, padx=6, pady=(0, 4))
+            self._gain_vars[key] = var
+            gains_frame.columnconfigure(col, weight=1)
+
+        self._gains_error_var = tk.StringVar(value="")
+        ttk.Label(gains_frame, textvariable=self._gains_error_var,
+                  foreground="red").grid(
+            row=2, column=0, columnspan=len(fields), pady=(0, 2))
+
+        ttk.Button(gains_frame, text="Apply Gains",
+                   command=self._apply_gains).grid(
+            row=3, column=0, columnspan=len(fields), pady=(0, 6))
+
+        # ── Live PID state ────────────────────────────────────────────
+        live_frame = ttk.LabelFrame(container, text="Live PID State")
+        live_frame.pack(fill="x", **pad)
+        live_frame.columnconfigure(1, weight=1)
+        live_frame.columnconfigure(3, weight=1)
+
+        self._live_vars = {}
+        live_fields = [
+            ("Setpoint",  "setpoint", "-- RPM",   0, 0),
+            ("Measured",  "measured", "-- RPM",   0, 2),
+            ("Error",     "error",    "--",        1, 0),
+            ("PWM",       "pwm",      "-- / 255",  1, 2),
+        ]
+        for label, key, default, row, col in live_fields:
+            ttk.Label(live_frame, text=label + ":").grid(
+                row=row, column=col, sticky="e", padx=(8, 2), pady=3)
+            var = tk.StringVar(value=default)
+            ttk.Label(live_frame, textvariable=var,
+                      font=("TkDefaultFont", 10, "bold")).grid(
+                row=row, column=col + 1, sticky="w", padx=(0, 8))
+            self._live_vars[key] = var
+
+        # ── Contribution bars ─────────────────────────────────────────
+        bars_frame = ttk.LabelFrame(container, text="PID Contribution")
+        bars_frame.pack(fill="x", **pad)
+        bars_frame.columnconfigure(1, weight=1)
+
+        self._bar_vars  = {}
+        self._bar_canvases = {}
+        for row_idx, (label, key, colour) in enumerate([
+            ("P", "p_term", "#4488cc"),
+            ("I", "i_term", "#44aa44"),
+            ("D", "d_term", "#cc8844"),
+            ("PWM", "pwm",  "#888888"),
+        ]):
+            ttk.Label(bars_frame, text=label, width=4, anchor="e").grid(
+                row=row_idx, column=0, padx=(6, 2), pady=2)
+            c = tk.Canvas(bars_frame, height=18, bg="#1e1e1e",
+                          highlightthickness=0)
+            c.grid(row=row_idx, column=1, sticky="ew", padx=(0, 4), pady=2)
+            val_var = tk.StringVar(value="--")
+            ttk.Label(bars_frame, textvariable=val_var, width=14,
+                      anchor="w").grid(row=row_idx, column=2, padx=(0, 6))
+            self._bar_canvases[key] = (c, colour)
+            self._bar_vars[key] = val_var
+
+        # ── Sparkline ─────────────────────────────────────────────────
+        spark_frame = ttk.LabelFrame(
+            container, text=f"Error History  ({self.HISTORY_SIZE} samples / 5s)")
+        spark_frame.pack(fill="x", **pad)
+        self._sparkline = Sparkline(spark_frame, width=380, height=60)
+        self._sparkline.pack(padx=6, pady=6)
+
+        # ── Run timer ─────────────────────────────────────────────────
+        timer_frame = ttk.Frame(container)
+        timer_frame.pack(fill="x", padx=8)
+        self._run_start = None
+        self._timer_var = tk.StringVar(value="Run time: --")
+        ttk.Label(timer_frame, textvariable=self._timer_var,
+                  foreground="gray").pack(side="left")
+        ttk.Button(timer_frame, text="Reset Timer",
+                   command=self._reset_timer).pack(side="right")
+
+        # ── Suggestions ───────────────────────────────────────────────
+        sugg_frame = ttk.LabelFrame(container, text="Tuning Suggestions")
+        sugg_frame.pack(fill="x", **pad)
+        sugg_frame.columnconfigure(0, weight=1)
+
+        # Up to 4 suggestion rows: text label + optional Apply button
+        self._sugg_rows = []
+        for row_idx in range(4):
+            text_var = tk.StringVar(value="")
+            lbl = ttk.Label(sugg_frame, textvariable=text_var,
+                            wraplength=300, justify="left")
+            lbl.grid(row=row_idx, column=0, sticky="w", padx=8, pady=2)
+            # Each button holds its own action reference directly,
+            # updated when suggestions change — avoids race condition
+            # where _update_suggestions rebuilds _sugg_rows between
+            # the user clicking and the command firing.
+            action_holder = [None]  # mutable container for current action
+            btn = ttk.Button(sugg_frame, text="Apply",
+                             command=lambda h=action_holder: h[0]() if h[0] else None)
+            btn.grid(row=row_idx, column=1, padx=(4, 8), pady=2)
+            btn.grid_remove()
+            self._sugg_rows.append((text_var, btn, action_holder))
+
+        # ── Bottom buttons ────────────────────────────────────────────
+        btn_frame = ttk.Frame(container)
+        btn_frame.pack(pady=(6, 0))
+        ttk.Button(btn_frame, text="Apply Gains",
+                   command=self._apply_gains).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Save Gains",
+                   command=self._save_gains).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Export CSV",
+                   command=self._export_csv).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Close",
+                   command=self._on_close).pack(side="left", padx=5)
+
+    # ------------------------------------------------------------------
+    # Debug enable/disable
+    # ------------------------------------------------------------------
+
+    def _enable_debug(self, enabled):
+        if self.panel.send_config:
+            self.panel.send_config(self.panel.motor_id, debug_enabled=enabled)
+
+    # ------------------------------------------------------------------
+    # Gains apply / save
+    # ------------------------------------------------------------------
+
+    def _parse_gains(self):
+        """Parse gain fields, return dict or None on error."""
+        result = {}
+        validations = {
+            "kp":             ("Kp",             "nonneg"),
+            "ki":             ("Ki",             "nonneg"),
+            "kd":             ("Kd",             "nonneg"),
+            "integral_limit": ("Integral Limit", "positive"),
+            "max_pwm_step":   ("PWM Slew Rate",  "positive_int"),
+        }
+        for key, (label, rule) in validations.items():
+            try:
+                v = float(self._gain_vars[key].get())
+                if rule == "positive" and v <= 0:
+                    raise ValueError
+                if rule == "positive_int" and (v <= 0 or v != int(v)):
+                    raise ValueError
+                if rule == "nonneg" and v < 0:
+                    raise ValueError
+                result[key] = int(v) if rule == "positive_int" else v
+            except ValueError:
+                self._gains_error_var.set(
+                    f"{label}: must be a {'positive integer' if rule == 'positive_int' else 'valid number'}.")
+                return None
+        self._gains_error_var.set("")
+        return result
+
+    def _apply_gains(self):
+        """Send updated gains to firmware immediately without saving to disk."""
+        gains = self._parse_gains()
+        if gains is None:
+            return
+        # Update panel's local cfg
+        merged = dict(self.panel.cfg)
+        merged.update(gains)
+        self.panel.cfg = merged
+
+        # Also update the GUI's master motor_config so send_motor_config
+        # reads the new values (it reads from motor_config, not panel.cfg)
+        app = self._get_app()
+        if app:
+            motor_key = str(self.panel.motor_id)
+            app.motor_config[motor_key].update(gains)
+
+        if self.panel.send_config:
+            self.panel.send_config(self.panel.motor_id, debug_enabled=True)
+
+    def _save_gains(self):
+        """Apply gains and persist to motor_config.json."""
+        gains = self._parse_gains()
+        if gains is None:
+            return
+        motor_key = str(self.panel.motor_id)
+        # Get the GUI's motor_config via the top-level app reference
+        app = self._get_app()
+        if app:
+            app.motor_config[motor_key].update(gains)
+            save_motor_config(app.motor_config)
+            self.panel.apply_config(app.motor_config[motor_key])
+            if self.panel.send_config:
+                self.panel.send_config(self.panel.motor_id, debug_enabled=True)
+            self._gains_error_var.set("✓ Saved")
+            self.after(2000, lambda: self._gains_error_var.set(""))
+
+    def _get_app(self):
+        """Walk up the widget tree to find MotorControlGUI instance."""
+        w = self.master
+        while w is not None:
+            if isinstance(w, tk.Tk):
+                # MotorControlGUI stores itself as app on root
+                return getattr(w, '_app', None)
+            w = getattr(w, 'master', None)
+        return None
+
+    # ------------------------------------------------------------------
+    # Debug queue polling and display update
+    # ------------------------------------------------------------------
+
+    def _reset_timer(self):
+        self._run_start = time.monotonic()
+        self._timer_var.set("Run time: 0s")
+
+    def _poll_debug_queue(self):
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                data = self.panel.debug_queue.get_nowait()
+                self._history.append(data)
+                if len(self._history) > self.HISTORY_SIZE:
+                    self._history.pop(0)
+                # Start run timer on first packet with active PWM
+                if self._run_start is None and data.get("pwm", 0) > 0:
+                    self._run_start = time.monotonic()
+        except queue.Empty:
+            pass
+
+        # Update run timer
+        if self._run_start is not None:
+            elapsed = time.monotonic() - self._run_start
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            self._timer_var.set(
+                f"Run time: {mins}m {secs:02d}s" if mins > 0 else f"Run time: {secs}s")
+
+        if self._history:
+            self._update_display(self._history[-1])
+            self._update_sparkline()
+            self._update_suggestions()
+
+        self.after(100, self._poll_debug_queue)
+
+    def _update_display(self, data):
+        sp  = data["setpoint"]
+        mea = data["measured"]
+        err = data["error"]
+        pwm = data["pwm"]
+        p   = data["p_term"]
+        i   = data["i_term"]
+        d   = data["d_term"]
+
+        self._live_vars["setpoint"].set(f"{sp:.1f} RPM")
+        self._live_vars["measured"].set(f"{mea:.1f} RPM")
+        self._live_vars["error"   ].set(f"{err:+.1f} RPM")
+        self._live_vars["pwm"     ].set(f"{pwm} / 255")
+
+        total = abs(p) + abs(i) + abs(d)
+
+        for key, (canvas, colour) in self._bar_canvases.items():
+            canvas.delete("all")
+            w = canvas.winfo_width() or 280
+            h = canvas.winfo_height() or 18
+
+            if key == "pwm":
+                ratio = pwm / 255.0
+                val   = pwm
+                label = f"{val}  ({ratio*100:.0f}%)"
+            else:
+                val = {"p_term": p, "i_term": i, "d_term": d}[key]
+                ratio = abs(val) / 255.0
+                pct   = (abs(val) / total * 100) if total > 0 else 0
+                label = f"{val:+.1f}  ({pct:.0f}%)"
+
+            bar_w = int(ratio * (w - 2))
+            if bar_w > 0:
+                canvas.create_rectangle(1, 1, bar_w, h - 1,
+                                        fill=colour, outline="")
+            self._bar_vars[key].set(label)
+
+    def _update_sparkline(self):
+        errors = [d["error"] for d in self._history]
+        self._sparkline.update(errors)
+
+    def _update_suggestions(self):
+        """Analyse recent history and populate suggestion rows with
+        specific recommended values and one-click Apply buttons."""
+        # Clear all rows
+        for var, btn, action_holder in self._sugg_rows:
+            var.set("")
+            btn.grid_remove()
+            action_holder[0] = None
+        self._sugg_rows[0][0].set("") if self._sugg_rows else None
+
+        if len(self._history) < 5:
+            self._sugg_rows[0][0].set("⏳ Collecting data...")
+            return
+
+        errors  = [d["error"]  for d in self._history]
+        pwms    = [d["pwm"]    for d in self._history]
+        i_terms = [d["i_term"] for d in self._history]
+        p_terms = [d["p_term"] for d in self._history]
+        sp      = self._history[-1]["setpoint"]
+
+        try:
+            kp  = float(self._gain_vars["kp"].get()             or 0)
+            ki  = float(self._gain_vars["ki"].get()             or 0)
+            kd  = float(self._gain_vars["kd"].get()             or 0)
+            lim = float(self._gain_vars["integral_limit"].get() or 255)
+        except ValueError:
+            return
+
+        suggestions = []  # list of (text, action_or_None)
+
+        # Oscillation
+        sign_changes = sum(1 for j in range(1, len(errors))
+                           if errors[j] * errors[j-1] < 0)
+        if sign_changes >= 6:
+            new_kp = round(kp * 0.7, 4)
+            suggestions.append((
+                f"⚠ Oscillating ({sign_changes} sign changes) — reduce Kp 30%  →  Kp = {new_kp}",
+                lambda v=new_kp: self._set_gain("kp", v)
+            ))
+
+        # PWM saturated
+        elif all(p >= 250 for p in pwms[-10:]):
+            suggestions.append((
+                "⚠ PWM saturated — setpoint may exceed motor's physical capability",
+                None
+            ))
+
+        # Steady undershoot
+        elif all(e > 0 for e in errors) and sp > 0 and errors[-1] > sp * 0.05:
+            if i_terms and abs(i_terms[-1]) >= lim * 0.95:
+                new_lim = round(lim * 2.0)
+                suggestions.append((
+                    f"⚠ Integral at limit — increase Integral Limit  →  {new_lim:.0f}",
+                    lambda v=new_lim: self._set_gain("integral_limit", v)
+                ))
+            else:
+                new_ki = round(ki * 1.5, 5)
+                suggestions.append((
+                    f"ℹ Steady undershoot — increase Ki  →  Ki = {new_ki}",
+                    lambda v=new_ki: self._set_gain("ki", v)
+                ))
+
+        # Steady overshoot
+        elif all(e < 0 for e in errors) and sp > 0 and abs(errors[-1]) > sp * 0.05:
+            new_ki = round(ki * 0.7, 5)
+            suggestions.append((
+                f"ℹ Steady overshoot — reduce Ki  →  Ki = {new_ki}",
+                lambda v=new_ki: self._set_gain("ki", v)
+            ))
+
+        # P term contributing little
+        avg_p = sum(abs(v) for v in p_terms) / len(p_terms) if p_terms else 0
+        avg_i = sum(abs(v) for v in i_terms) / len(i_terms) if i_terms else 0
+        if avg_i > 0 and avg_p < avg_i * 0.05 and sign_changes < 6:
+            new_kp = round(kp * 1.3, 4)
+            suggestions.append((
+                f"ℹ P term contributing little — increase Kp  →  Kp = {new_kp}",
+                lambda v=new_kp: self._set_gain("kp", v)
+            ))
+
+        # Stable
+        if sp > 0 and all(abs(e) < sp * 0.02 for e in errors):
+            suggestions.append((
+                "✓ Stable — error within 2%  Consider clicking Save Gains",
+                None
+            ))
+
+        # Converging
+        if len(errors) >= 10 and not suggestions:
+            recent = errors[-5:]
+            older  = errors[-10:-5]
+            if sum(abs(e) for e in recent) < sum(abs(e) for e in older):
+                suggestions.append(("ℹ Converging — wait for settle", None))
+
+        if not suggestions:
+            suggestions.append(("ℹ Monitoring...", None))
+
+        # Populate rows — update action_holder in place so button
+        # commands always reference the current action even if
+        # _update_suggestions runs again before the click fires.
+        for i, (var, btn, action_holder) in enumerate(self._sugg_rows):
+            if i < len(suggestions):
+                text, action = suggestions[i]
+                var.set(text)
+                action_holder[0] = action
+                if action is not None:
+                    btn.grid()
+                else:
+                    btn.grid_remove()
+            else:
+                var.set("")
+                action_holder[0] = None
+                btn.grid_remove()
+
+    def _set_gain(self, key, value):
+        """Set a gain field to a specific value and apply immediately.
+        Updates the field visually and confirms with a brief status message."""
+        fmt = ".0f" if key in ("integral_limit", "max_pwm_step") else "g"
+        self._gain_vars[key].set(f"{value:{fmt}}")
+        self._apply_gains()
+        # Brief confirmation so user can see the field was updated
+        self._gains_error_var.set(f"✓ Applied {key} = {value:{fmt}}")
+        self.after(2000, lambda: self._gains_error_var.set(""))
+
+    def _export_csv(self):
+        """Save the current debug history to a timestamped CSV file."""
+        if not self._history:
+            messagebox.showinfo("Export", "No data to export yet.")
+            return
+        import csv
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"pid_debug_m{self.panel.motor_id}_{ts}.csv")
+        try:
+            with open(filename, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "motor_id", "setpoint", "measured", "error",
+                    "p_term", "i_term", "d_term", "pwm"])
+                writer.writeheader()
+                writer.writerows(self._history)
+            messagebox.showinfo(
+                "Export", f"Saved {len(self._history)} samples:\n{filename}")
+        except OSError as e:
+            messagebox.showerror("Export Error", str(e))
+
+    def _on_close(self):
+        self._enable_debug(False)
+        self.destroy()
+
+
 class SettingsWindow(tk.Toplevel):
     FIELDS = [
         ("ppr",              "PPR",             "Encoder lines/gaps per motor shaft revolution (datasheet value)", "positive"),
         ("gear_ratio",       "Gear Ratio",      "Motor shaft revs per output shaft rev (1.0 = no gearbox)",       "positive"),
         ("max_motor_rpm",    "Max Motor RPM",   "Sets setpoint slider range",                                      "positive"),
         ("wheel_diameter_mm","Wheel Dia (mm)",  "Output shaft wheel diameter. 0 = no wheel",                      "nonneg"),
-        ("kp",               "Kp",              "PID proportional gain",                                           "nonneg"),
-        ("ki",               "Ki",              "PID integral gain",                                               "nonneg"),
-        ("kd",               "Kd",              "PID derivative gain",                                             "nonneg"),
-        ("integral_limit",   "Integral Limit",  "Anti-windup clamp",                                               "positive"),
     ]
 
     def __init__(self, parent, current_config, on_save):
@@ -874,7 +1479,8 @@ class MotorControlGUI:
         motors_frame = ttk.Frame(root)
         motors_frame.pack(padx=10, pady=10, fill="both", expand=True)
         for i in range(1, NUM_MOTORS + 1):
-            panel = MotorControlPanel(motors_frame, i, self.send_command)
+            panel = MotorControlPanel(motors_frame, i, self.send_command,
+                                      send_config_cb=self.send_motor_config)
             panel.grid(row=0, column=i - 1, padx=10, pady=6, sticky="nsew")
             motors_frame.columnconfigure(i - 1, weight=1)
             cfg = self.motor_config.get(str(i), default_motor_config()[str(i)])
@@ -961,7 +1567,10 @@ class MotorControlGUI:
             self._last_packet_time = {m: None for m in range(1, NUM_MOTORS + 1)}
             for panel in self.motor_frames:
                 panel.reset_total_count()
-            self.serial_reader = SerialReader(self.serial_port, self.encoder_queue)
+            self.serial_reader = SerialReader(
+                self.serial_port, self.encoder_queue,
+                debug_queues={panel.motor_id: panel.debug_queue
+                              for panel in self.motor_frames})
             self.serial_reader.start()
 
             # Reset firmware to a known stopped state so it matches
@@ -1091,12 +1700,12 @@ class MotorControlGUI:
         else:
             messagebox.showwarning("Not Connected", "Please connect to a USB CDC device first.")
 
-    def send_motor_config(self, motor_id):
+    def send_motor_config(self, motor_id, debug_enabled=False):
         motor_key = str(motor_id)
         defaults  = default_motor_config()[motor_key]
         cfg       = self.motor_config.get(motor_key, defaults)
 
-        packet = bytearray(20)
+        packet = bytearray(22)
         packet[0] = 0xBB
         packet[1] = motor_id
         struct.pack_into('<H', packet, 2,  int(cfg.get('ppr',             defaults['ppr'])))
@@ -1104,6 +1713,8 @@ class MotorControlGUI:
         struct.pack_into('<f', packet, 8,  float(cfg.get('ki',            defaults['ki'])))
         struct.pack_into('<f', packet, 12, float(cfg.get('kd',            defaults['kd'])))
         struct.pack_into('<f', packet, 16, float(cfg.get('integral_limit',defaults['integral_limit'])))
+        packet[20] = int(max(1, min(255, cfg.get('max_pwm_step', defaults['max_pwm_step']))))
+        packet[21] = 1 if debug_enabled else 0
 
         if self.serial_port and self.serial_port.is_open:
             try:
@@ -1155,5 +1766,6 @@ if __name__ == "__main__":
     style.map("ActiveBrake.TButton", background=[("!disabled", "orange")], foreground=[("!disabled", "black")])
 
     app = MotorControlGUI(root)
+    root._app = app  # allows PIDTuningWindow to find the app via widget tree
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
