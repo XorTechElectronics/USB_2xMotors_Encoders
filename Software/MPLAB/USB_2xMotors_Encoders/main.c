@@ -65,7 +65,7 @@
     #define RPM_WINDOW_TICKS    ((TCA0_OVERFLOW_RATE * RPM_WINDOW_MS) / 1000UL)  // 2344
 
 //Sync Gains - how aggressively motor 2 corrects drift
-    #define SYNC_GAIN       0.1f
+    #define SYNC_GAIN       0.2f
     #define SYNC_MAX_RPM 6000.0f    
 
 

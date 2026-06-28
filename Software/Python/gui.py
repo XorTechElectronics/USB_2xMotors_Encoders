@@ -272,6 +272,34 @@ class SerialReader(threading.Thread):
 # Motor control panel
 # ----------------------------------------------------------------------
 
+class Tooltip:
+    """Simple hover tooltip for any Tkinter widget."""
+    def __init__(self, widget, text):
+        self.widget  = widget
+        self.text    = text
+        self._tip_window = None
+        widget.bind("<Enter>", self._show)
+        widget.bind("<Leave>", self._hide)
+
+    def _show(self, event=None):
+        if self._tip_window:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self._tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)  # no window decorations
+        tw.wm_geometry(f"+{x}+{y}")
+        ttk.Label(tw, text=self.text, justify="left",
+                  background="#ffffe0", relief="solid", borderwidth=1,
+                  font=("TkDefaultFont", 9),
+                  wraplength=280).pack(padx=4, pady=3)
+
+    def _hide(self, event=None):
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+
 class MotorControlPanel(ttk.LabelFrame):
     """
     Per-motor control panel with three display tiers:
@@ -287,7 +315,9 @@ class MotorControlPanel(ttk.LabelFrame):
     RPM_WINDOW_SIZE = 20  # ~2 seconds of smoothing at 10Hz
 
     def __init__(self, parent, motor_id, send_command_cb, send_config_cb=None):
-        super().__init__(parent, text=f"Motor {motor_id}")
+        super().__init__(parent, text=f"  Motor {motor_id}  ",
+                         labelanchor="n",
+                         style="Motor.TLabelframe")
         self.motor_id     = motor_id
         self.send_command = send_command_cb
         self.send_config  = send_config_cb  # GUI's send_motor_config(motor_id, debug)
@@ -1520,33 +1550,72 @@ class MotorControlGUI:
         self.port_combo.pack(side="left", padx=5)
         ttk.Button(detect_frame, text="Refresh Ports", command=self.refresh_ports).pack(side="left", padx=5)
         ttk.Button(detect_frame, text="Connect",       command=self.connect_selected_port).pack(side="left", padx=5)
-        ttk.Button(detect_frame, text="Settings...",   command=self.open_settings).pack(side="left", padx=5)
-
-        self.btn_sync = ttk.Button(detect_frame, text="🔗 Sync",
-                                   command=self.toggle_sync, state="disabled")
-        self.btn_sync.pack(side="left", padx=5)
-
-        self.sync_status_var = tk.StringVar(value="")
-        ttk.Label(detect_frame, textvariable=self.sync_status_var,
-                  foreground="green").pack(side="left", padx=5)
 
         self.status_label = ttk.Label(root, text="Status: Not connected")
-        self.status_label.pack(pady=5)
+        self.status_label.pack(pady=(2, 0))
+
+        # --- Shared motor toolbar — Settings only ---
+        toolbar_frame = ttk.Frame(root)
+        toolbar_frame.pack(padx=10, pady=(4, 0), fill="x")
+        ttk.Button(toolbar_frame, text="⚙ Settings...",
+                   command=self.open_settings).pack(side="left", padx=5)
 
         self.refresh_ports()
 
-        # Motor panels — side by side
+        # Motor panels — Motor 1 | Sync column | Motor 2
         self.motor_frames = []
         motors_frame = ttk.Frame(root)
-        motors_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        motors_frame.pack(padx=10, pady=(4, 10), fill="both", expand=True)
+        motors_frame.columnconfigure(0, weight=1)
+        motors_frame.columnconfigure(1, weight=0)  # sync column — fixed width
+        motors_frame.columnconfigure(2, weight=1)
+
         for i in range(1, NUM_MOTORS + 1):
+            col = 0 if i == 1 else 2
             panel = MotorControlPanel(motors_frame, i, self.send_command,
                                       send_config_cb=self.send_motor_config)
-            panel.grid(row=0, column=i - 1, padx=10, pady=6, sticky="nsew")
-            motors_frame.columnconfigure(i - 1, weight=1)
+            panel.grid(row=0, column=col, padx=6, pady=6, sticky="nsew")
             cfg = self.motor_config.get(str(i), default_motor_config()[str(i)])
             panel.apply_config(cfg)
             self.motor_frames.append(panel)
+
+        # Sync column — fixed width, centred between the two motor panels
+        sync_col = ttk.Frame(motors_frame, width=80)
+        sync_col.grid(row=0, column=1, padx=4, pady=6, sticky="ns")
+        sync_col.grid_propagate(False)  # prevent content from resizing the column
+        sync_col.rowconfigure(0, weight=1)
+        sync_col.rowconfigure(4, weight=1)
+
+        self.sync_status_var = tk.StringVar(value="")  # kept for internal state
+
+        self.btn_sync = ttk.Button(sync_col, text="Motor\nSync",
+                                   command=self.toggle_sync, state="disabled",
+                                   width=8, style="Sync.TButton")
+        self.btn_sync.grid(row=1, column=0, pady=4)
+        Tooltip(self.btn_sync,
+                "Synchronise both motors using encoder\n"
+                "count tracking.\n\n"
+                "How to use:\n"
+                "  1. Stop both motors, disable both PIDs\n"
+                "  2. Click Motor Sync to enable\n"
+                "  3. Set direction on each motor (CW/CCW)\n"
+                "  4. Set velocity setpoint on Motor 1\n"
+                "  5. Click Enable PID on Motor 1\n\n"
+                "Motor 2 will track Motor 1 automatically.\n"
+                "Directions can differ (e.g. for a rover).")
+
+        self.sync_error_title = ttk.Label(sync_col, text="Encoder Error",
+                  font=("TkDefaultFont", 8), anchor="center",
+                  width=12)
+        self.sync_error_title.grid(row=2, column=0, pady=(8, 0))
+        self.sync_error_var = tk.StringVar(value="--")
+        self.sync_error_label = ttk.Label(sync_col, textvariable=self.sync_error_var,
+                  font=("TkDefaultFont", 9, "bold"), anchor="center",
+                  foreground="gray", width=12)
+        self.sync_error_label.grid(row=3, column=0)
+        # Hidden until sync is active
+        self.sync_error_title.grid_remove()
+        self.sync_error_label.grid_remove()
 
         # When Motor 1 setpoint changes and sync is active, mirror to Motor 2
         def _m1_setpoint_changed():
@@ -1672,10 +1741,14 @@ class MotorControlGUI:
             self._restore_motor2_controls()
 
         if self._sync_enabled:
-            self.btn_sync.configure(text="🔗 Synced", style="ActiveDir.TButton")
+            self.btn_sync.configure(text="Motor\nSync", style="ActiveSync.TButton")
+            self.sync_error_title.grid()
+            self.sync_error_label.grid()
         else:
-            self.btn_sync.configure(text="🔗 Sync", style="TButton")
-            self.sync_status_var.set("")
+            self.btn_sync.configure(text="Motor\nSync", style="Sync.TButton")
+            self.sync_error_var.set("--")
+            self.sync_error_title.grid_remove()
+            self.sync_error_label.grid_remove()
 
     # ------------------------------------------------------------------
     # Settings
@@ -1795,14 +1868,11 @@ class MotorControlGUI:
             pass
 
         for latest_ts, latest, sync_err, sync_on in packets:
-            # Update sync status display
+            # Update sync error display
             if sync_on:
-                if abs(sync_err) < 5:
-                    self.sync_status_var.set("✓ Synced")
-                else:
-                    self.sync_status_var.set(f"Syncing... ({sync_err:+d})")
+                self.sync_error_var.set(f"{sync_err:+d}")
             else:
-                self.sync_status_var.set("")
+                self.sync_error_var.set("--")
 
             # Also refresh sync button state in case PID was enabled/disabled
             self._update_sync_button()
@@ -1991,6 +2061,20 @@ if __name__ == "__main__":
     root = tk.Tk()
     style = ttk.Style(root)
     style.theme_use("clam")
+
+    # Motor panel title — larger bold font
+    style.configure("Motor.TLabelframe",       borderwidth=2)
+    style.configure("Motor.TLabelframe.Label", font=("TkDefaultFont", 12, "bold"))
+
+    # Sync button — bold, centred
+    style.configure("Sync.TButton",
+                    font=("TkDefaultFont", 10, "bold"), anchor="center")
+    style.configure("ActiveSync.TButton",
+                    font=("TkDefaultFont", 10, "bold"), anchor="center",
+                    background="green", foreground="white")
+    style.map("ActiveSync.TButton",
+              background=[("!disabled", "green")],
+              foreground=[("!disabled", "white")])
 
     style.configure("ActiveDir.TButton",   background="green",  foreground="white")
     style.configure("ActiveStop.TButton",  background="red",    foreground="white")
