@@ -300,7 +300,7 @@ class Tooltip:
             self._tip_window = None
 
 
-class MotorControlPanel(ttk.LabelFrame):
+class MotorControlPanel(ttk.Frame):
     """
     Per-motor control panel with three display tiers:
       1. Motor shaft RPM  (raw from firmware)
@@ -315,13 +315,11 @@ class MotorControlPanel(ttk.LabelFrame):
     RPM_WINDOW_SIZE = 20  # ~2 seconds of smoothing at 10Hz
 
     def __init__(self, parent, motor_id, send_command_cb, send_config_cb=None):
-        super().__init__(parent, text=f"  Motor {motor_id}  ",
-                         labelanchor="n",
-                         style="Motor.TLabelframe")
+        super().__init__(parent, relief="groove", borderwidth=2)
         self.motor_id     = motor_id
         self.send_command = send_command_cb
-        self.send_config  = send_config_cb  # GUI's send_motor_config(motor_id, debug)
-        self.debug_queue  = queue.Queue()   # receives PID debug packets from SerialReader
+        self.send_config  = send_config_cb
+        self.debug_queue  = queue.Queue()
 
         # Motor state
         self.motor_in1 = 0
@@ -356,6 +354,23 @@ class MotorControlPanel(ttk.LabelFrame):
         for c in range(CC):
             self.columnconfigure(c, weight=1)
         row = 0
+
+        # ── Header: Motor title + Tests button ────────────────────────
+        header = ttk.Frame(self)
+        header.grid(row=row, column=0, columnspan=CC, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text=f"Motor {self.motor_id}",
+                  font=("TkDefaultFont", 12, "bold"),
+                  anchor="center").grid(row=0, column=0, padx=8, pady=6, sticky="ew")
+        self.btn_tests = ttk.Button(header, text="Tests ▶",
+                                    command=self._open_tests, width=8)
+        self.btn_tests.grid(row=0, column=1, padx=(0, 6), pady=4)
+        self._tests_window = None
+        row += 1
+
+        ttk.Separator(self, orient="horizontal").grid(
+            row=row, column=0, columnspan=CC, sticky="ew")
+        row += 1
 
         # ── Manual controls ───────────────────────────────────────────
         ttk.Label(self, text="Speed").grid(row=row, column=0, columnspan=CC, pady=(6, 0))
@@ -750,6 +765,16 @@ class MotorControlPanel(ttk.LabelFrame):
         """Called when PID is enabled/disabled — GUI hooks this to
         lock direction controls during sync."""
         pass  # overridden by MotorControlGUI after panel creation
+
+    def _open_tests(self):
+        """Open (or refocus) the motor tests window for this motor."""
+        if (self._tests_window is not None and
+                self._tests_window.winfo_exists()):
+            self._tests_window.lift()
+            self._tests_window.focus_set()
+            return
+        self._tests_window = MotorTestsWindow(
+            self.winfo_toplevel(), self)
 
     def _open_pid_tuning(self):
         """Open (or refocus) the PID tuning window for this motor."""
@@ -1411,6 +1436,526 @@ class PIDTuningWindow(tk.Toplevel):
         self.destroy()
 
 
+
+class StepResponseWindow(tk.Toplevel):
+    """
+    Step response test — spins motor from stopped to 75% max RPM
+    with PID enabled, records 50 samples (5 seconds), plots the
+    response curve and suggests PID gain adjustments.
+    """
+    SAMPLES  = 50
+    TEST_PCT = 0.75
+
+    def __init__(self, parent, panel):
+        super().__init__(parent)
+        self.panel  = panel
+        self.title(f"Motor {panel.motor_id} — Step Response Test")
+        self.resizable(False, False)
+        self.transient(parent)
+        self._samples  = []
+        self._setpoint = 0.0
+        self._running  = False
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        container = ttk.Frame(self, padding=10)
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(container,
+                  text=f"Runs Motor {self.panel.motor_id} from stopped to "
+                       f"{int(self.TEST_PCT*100)}% of max RPM with PID enabled.\n"
+                       f"Records {self.SAMPLES} samples (~5 seconds) then stops automatically.",
+                  justify="left", foreground="gray").pack(anchor="w")
+
+        ctrl = ttk.Frame(container)
+        ctrl.pack(fill="x", pady=(6, 0))
+        self.btn_run = ttk.Button(ctrl, text="▶  Run Test", command=self._run_test)
+        self.btn_run.pack(side="left")
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(ctrl, textvariable=self.status_var,
+                  foreground="gray").pack(side="left", padx=10)
+
+        plot_frame = ttk.LabelFrame(container, text="Response Curve")
+        plot_frame.pack(fill="x", pady=(8, 0))
+        self.canvas = tk.Canvas(plot_frame, width=460, height=200,
+                                bg="#1e1e1e", highlightthickness=0)
+        self.canvas.pack(padx=6, pady=6)
+
+        mf = ttk.LabelFrame(container, text="Metrics")
+        mf.pack(fill="x", pady=(8, 0))
+        self._metric_vars = {}
+        for col, (key, label) in enumerate([
+            ("rise_time",    "Rise Time"),
+            ("overshoot",    "Overshoot"),
+            ("settling",     "Settling Time"),
+            ("steady_err",   "Steady Error"),
+            ("oscillations", "Oscillations"),
+        ]):
+            f = ttk.Frame(mf)
+            f.grid(row=0, column=col, padx=8, pady=4, sticky="ew")
+            mf.columnconfigure(col, weight=1)
+            ttk.Label(f, text=label, font=("TkDefaultFont", 8),
+                      foreground="gray", anchor="center").pack()
+            var = tk.StringVar(value="--")
+            ttk.Label(f, textvariable=var, font=("TkDefaultFont", 10, "bold"),
+                      anchor="center").pack()
+            self._metric_vars[key] = var
+
+        sf = ttk.LabelFrame(container, text="Suggestions")
+        sf.pack(fill="x", pady=(8, 0))
+        sf.columnconfigure(0, weight=1)
+        self._sugg_rows = []
+        for i in range(3):
+            var = tk.StringVar(value="")
+            lbl = ttk.Label(sf, textvariable=var, justify="left", wraplength=360)
+            lbl.grid(row=i, column=0, sticky="w", padx=8, pady=2)
+            ah = [None]
+            btn = ttk.Button(sf, text="Apply",
+                             command=lambda h=ah: h[0]() if h[0] else None)
+            btn.grid(row=i, column=1, padx=(4, 8), pady=2)
+            btn.grid_remove()
+            self._sugg_rows.append((var, btn, ah))
+
+        bf = ttk.Frame(container)
+        bf.pack(pady=(8, 0))
+        ttk.Button(bf, text="Export CSV", command=self._export_csv).pack(side="left", padx=5)
+        ttk.Button(bf, text="Close", command=self._on_close).pack(side="left", padx=5)
+
+    def _run_test(self):
+        app = self._get_app()
+        print(f"StepTest _run_test: app={app}, connected={app.serial_port.is_open if app and app.serial_port else False}")
+        if not app or not app.serial_port or not app.serial_port.is_open:
+            self.status_var.set("Not connected")
+            return
+        cfg = self.panel.cfg
+        max_rpm = cfg.get("max_motor_rpm", DEFAULT_MAX_MOTOR_RPM)
+        self._setpoint = max_rpm * self.TEST_PCT
+        self._samples  = []
+        self._running  = True
+        self.btn_run.configure(state="disabled", text="Running...")
+        self.status_var.set("Starting motor...")
+        self.canvas.delete("all")
+        for var, btn, _ in self._sugg_rows:
+            var.set(""); btn.grid_remove()
+        for var in self._metric_vars.values():
+            var.set("--")
+
+        panel = self.panel
+        panel.motor_in1 = 1; panel.motor_in2 = 0
+        panel.motor_pwm = 0
+        panel.reset_direction_styles()
+        panel.btn_cw.configure(style="ActiveDir.TButton")
+        panel.output_pid_enabled   = True
+        panel.velocity_pid_enabled = False
+        gear = cfg.get("gear_ratio", 1.0)
+        output_sp = self._setpoint / gear if gear > 0 else self._setpoint
+        panel.output_sp_var.set(output_sp)
+        panel.output_sp_entry_var.set(f"{output_sp:.1f}")
+        panel._update_pid_buttons()
+        if panel.send_config:
+            panel.send_config(panel.motor_id, debug_enabled=True)
+        print(f"StepTest sending: motor_in1={panel.motor_in1} motor_in2={panel.motor_in2} pid={panel.output_pid_enabled} sp={panel.output_sp_entry_var.get()}")
+        app.send_command()
+        self.status_var.set(f"Recording... (0/{self.SAMPLES})")
+        self.after(100, self._collect_sample)
+
+    def _collect_sample(self):
+        if not self._running:
+            return
+        latest = None
+        try:
+            while True:
+                latest = self.panel.debug_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if latest:
+            self._samples.append(latest.get("measured", 0.0))
+            self.status_var.set(f"Recording... ({len(self._samples)}/{self.SAMPLES})")
+            self._draw_live()
+        if len(self._samples) >= self.SAMPLES:
+            self._finish_test()
+            return
+        self.after(100, self._collect_sample)
+
+    def _finish_test(self):
+        self._running = False
+        panel = self.panel
+        app   = self._get_app()
+        panel.motor_in1 = 0; panel.motor_in2 = 0
+        panel.motor_pwm = 0
+        panel.output_pid_enabled   = False
+        panel.velocity_pid_enabled = False
+        panel.reset_direction_styles()
+        panel.btn_stop.configure(style="ActiveStop.TButton")
+        panel._update_pid_buttons()
+        if panel.send_config:
+            panel.send_config(panel.motor_id, debug_enabled=False)
+        if app:
+            app.send_command()
+        self.btn_run.configure(state="normal", text="▶  Run Test")
+        self.status_var.set(f"Complete — {len(self._samples)} samples")
+        self._draw_final()
+        self._analyse()
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+
+    def _axes(self):
+        W, H = 460, 200
+        P = {"l": 44, "r": 10, "t": 10, "b": 25}
+        pw = W - P["l"] - P["r"]
+        ph = H - P["t"] - P["b"]
+        max_rpm = self.panel.cfg.get("max_motor_rpm", DEFAULT_MAX_MOTOR_RPM)
+        for i in range(5):
+            y = P["t"] + int(ph * i / 4)
+            self.canvas.create_line(P["l"], y, W - P["r"], y,
+                                    fill="#333", dash=(2, 4))
+            self.canvas.create_text(P["l"] - 4, y,
+                                    text=f"{max_rpm*(1-i/4):.0f}",
+                                    fill="#888", anchor="e",
+                                    font=("TkDefaultFont", 7))
+        for i in range(6):
+            x = P["l"] + int(pw * i / 5)
+            self.canvas.create_line(x, P["t"], x, H - P["b"],
+                                    fill="#333", dash=(2, 4))
+            self.canvas.create_text(x, H - P["b"] + 8,
+                                    text=f"{i}s", fill="#888",
+                                    font=("TkDefaultFont", 7))
+        sp_y = P["t"] + int(ph * (1 - self._setpoint / max_rpm))
+        self.canvas.create_line(P["l"], sp_y, W - P["r"], sp_y,
+                                fill="#4488cc", dash=(4, 4))
+        self.canvas.create_text(W - P["r"] - 2, sp_y - 6,
+                                text="SP", fill="#4488cc",
+                                font=("TkDefaultFont", 7), anchor="e")
+        band = self._setpoint * 0.05
+        for rpm in [self._setpoint + band, self._setpoint - band]:
+            y = P["t"] + int(ph * (1 - max(0, rpm) / max_rpm))
+            if P["t"] <= y <= H - P["b"]:
+                self.canvas.create_line(P["l"], y, W - P["r"], y,
+                                        fill="#446644", dash=(2, 6))
+        return P, pw, ph, W, H, max_rpm
+
+    def _to_y(self, rpm, max_rpm, P, ph):
+        return P["t"] + int(ph * (1 - max(0, min(rpm, max_rpm)) / max_rpm))
+
+    def _draw_live(self):
+        self.canvas.delete("all")
+        if not self._samples:
+            return
+        P, pw, ph, W, H, max_rpm = self._axes()
+        n = self.SAMPLES
+        pts = [(P["l"] + int(pw * i / (n-1)),
+                self._to_y(r, max_rpm, P, ph)) for i, r in enumerate(self._samples)]
+        sp = self._setpoint
+        for i in range(1, len(pts)):
+            x1, y1 = pts[i-1]; x2, y2 = pts[i]
+            colour = "#cc4444" if self._samples[i] > sp * 1.05 else "#4488cc"
+            self.canvas.create_line(x1, y1, x2, y2, fill=colour, width=2)
+
+    def _draw_final(self):
+        self.canvas.delete("all")
+        if not self._samples:
+            return
+        P, pw, ph, W, H, max_rpm = self._axes()
+        n  = self.SAMPLES
+        sp = self._setpoint
+        band = sp * 0.05
+        samples = self._samples
+        pts = [(P["l"] + int(pw * i / (n-1)),
+                self._to_y(r, max_rpm, P, ph)) for i, r in enumerate(samples)]
+        crossed = False
+        for i in range(1, len(pts)):
+            x1, y1 = pts[i-1]; x2, y2 = pts[i]
+            r = samples[i]
+            if r >= sp * 0.9: crossed = True
+            colour = ("#cc4444" if r > sp * 1.05 else
+                      "#44aa44" if crossed and abs(r - sp) <= band else
+                      "#4488cc")
+            self.canvas.create_line(x1, y1, x2, y2, fill=colour, width=2)
+        # Peak marker
+        peak_i = samples.index(max(samples))
+        px, py = pts[peak_i]
+        self.canvas.create_oval(px-4, py-4, px+4, py+4,
+                                fill="#cc4444", outline="")
+        self.canvas.create_text(px, py-10, text=f"{samples[peak_i]:.0f}",
+                                fill="#cc4444", font=("TkDefaultFont", 7))
+        # Rise time marker
+        rise_i = next((i for i, r in enumerate(samples) if r >= sp*0.9), None)
+        if rise_i:
+            rx, ry = pts[rise_i]
+            self.canvas.create_oval(rx-4, ry-4, rx+4, ry+4,
+                                    fill="#4488cc", outline="")
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
+    def _analyse(self):
+        samples = self._samples
+        sp      = self._setpoint
+        band    = sp * 0.05
+        n       = len(samples)
+        if n < 5 or sp <= 0:
+            return
+        rise_i = next((i for i, r in enumerate(samples) if r >= sp * 0.9), None)
+        rise_s = rise_i * 0.1 if rise_i is not None else None
+        peak   = max(samples)
+        overshoot = max(0.0, (peak - sp) / sp * 100)
+        settling_i = None
+        if rise_i is not None:
+            for i in range(rise_i, n):
+                if abs(samples[i] - sp) > band:
+                    settling_i = i
+        settling_s = (settling_i + 1) * 0.1 if settling_i else rise_s
+        steady_err = abs(sp - sum(samples[-10:]) / 10) if n >= 10 else None
+        if rise_i is not None:
+            diffs = [s - sp for s in samples[rise_i:]]
+            osc = sum(1 for i in range(1, len(diffs)) if diffs[i] * diffs[i-1] < 0)
+        else:
+            osc = 0
+
+        self._metric_vars["rise_time"].set(
+            f"{rise_s:.1f}s" if rise_s is not None else "No rise")
+        self._metric_vars["overshoot"].set(f"{overshoot:.1f}%")
+        self._metric_vars["settling"].set(
+            f"{settling_s:.1f}s" if settling_s is not None else "--")
+        self._metric_vars["steady_err"].set(
+            f"{steady_err:.0f} RPM" if steady_err is not None else "--")
+        self._metric_vars["oscillations"].set(str(osc))
+
+        try:
+            kp = float(self.panel.cfg.get("kp", 0.05))
+            ki = float(self.panel.cfg.get("ki", 0.02))
+            kd = float(self.panel.cfg.get("kd", 0.0))
+        except (ValueError, TypeError):
+            kp, ki, kd = 0.05, 0.02, 0.0
+
+        suggestions = []
+        if rise_i is None:
+            new_kp = round(kp * 2, 4)
+            suggestions.append((
+                "⚠ Motor did not reach setpoint — increase Kp",
+                lambda v=new_kp: self._apply_gain("kp", v)))
+        elif osc >= 3:
+            new_kp = round(kp * 0.7, 4)
+            suggestions.append((
+                f"⚠ Oscillating ({osc} cycles) — reduce Kp 30%  →  Kp = {new_kp}",
+                lambda v=new_kp: self._apply_gain("kp", v)))
+        elif overshoot > 20:
+            new_kp = round(kp * 0.8, 4)
+            suggestions.append((
+                f"⚠ Overshoot {overshoot:.1f}% — reduce Kp 20%  →  Kp = {new_kp}",
+                lambda v=new_kp: self._apply_gain("kp", v)))
+        elif overshoot > 5 and kd < 0.001:
+            new_kd = round(kp * 0.1, 5)
+            suggestions.append((
+                f"ℹ Overshoot {overshoot:.1f}% — add Kd to damp  →  Kd = {new_kd}",
+                lambda v=new_kd: self._apply_gain("kd", v)))
+        if rise_s is not None and rise_s > 2.0 and osc < 3:
+            new_kp = round(kp * 1.3, 4)
+            suggestions.append((
+                f"ℹ Slow rise ({rise_s:.1f}s) — increase Kp  →  Kp = {new_kp}",
+                lambda v=new_kp: self._apply_gain("kp", v)))
+        if steady_err is not None and steady_err > sp * 0.05:
+            new_ki = round(ki * 1.5, 5)
+            suggestions.append((
+                f"ℹ Steady error {steady_err:.0f} RPM — increase Ki  →  Ki = {new_ki}",
+                lambda v=new_ki: self._apply_gain("ki", v)))
+        if (rise_s is not None and rise_s < 1.0 and overshoot < 5
+                and osc < 2 and steady_err is not None and steady_err < sp * 0.05):
+            suggestions.append(("✓ Well tuned — consider saving gains", None))
+        if not suggestions:
+            suggestions.append(
+                ("ℹ Response looks reasonable — fine-tune in PID Tuning window", None))
+
+        for i, (var, btn, ah) in enumerate(self._sugg_rows):
+            if i < len(suggestions):
+                text, action = suggestions[i]
+                var.set(text); ah[0] = action
+                btn.grid() if action else btn.grid_remove()
+            else:
+                var.set(""); ah[0] = None; btn.grid_remove()
+
+    def _apply_gain(self, key, value):
+        app = self._get_app()
+        if not app:
+            return
+        motor_key = str(self.panel.motor_id)
+        app.motor_config[motor_key][key] = value
+        self.panel.cfg[key] = value
+        if self.panel.send_config:
+            self.panel.send_config(self.panel.motor_id, debug_enabled=False)
+        self.status_var.set(f"Applied {key} = {value} — run again to verify")
+
+    def _export_csv(self):
+        if not self._samples:
+            messagebox.showinfo("Export", "No data to export yet.")
+            return
+        import csv
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        fn = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          f"step_response_m{self.panel.motor_id}_{ts}.csv")
+        try:
+            with open(fn, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["sample", "time_s", "rpm", "setpoint"])
+                for i, rpm in enumerate(self._samples):
+                    w.writerow([i, f"{i*0.1:.1f}", f"{rpm:.1f}",
+                                f"{self._setpoint:.1f}"])
+            messagebox.showinfo("Export",
+                f"Saved {len(self._samples)} samples:\n{fn}")
+        except OSError as e:
+            messagebox.showerror("Export Error", str(e))
+
+    def _get_app(self):
+        """Walk up widget tree to find MotorControlGUI stored on root Tk."""
+        try:
+            root = self.winfo_toplevel()
+            # winfo_toplevel on a Toplevel returns itself — keep going via master
+            w = self
+            while w is not None:
+                if isinstance(w, tk.Tk):
+                    return getattr(w, '_app', None)
+                w = getattr(w, 'master', None)
+        except Exception:
+            pass
+        return None
+
+    def _on_close(self):
+        self._running = False
+        self.destroy()
+
+
+class MotorTestsWindow(tk.Toplevel):
+    """Motor test suite window."""
+
+    def __init__(self, parent, panel):
+        super().__init__(parent)
+        self.panel = panel
+        self.title(f"Motor {panel.motor_id} — Tests")
+        self.resizable(False, False)
+        self.transient(parent)
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+    def _build_ui(self):
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill="both", expand=True)
+        ttk.Label(container, text=f"Motor {self.panel.motor_id} — Test Suite",
+                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 10))
+
+        self._enc_card = self._build_card(container,
+            "Encoder Direction",
+            "Spins the motor CW briefly and checks whether the encoder\n"
+            "counts in the correct direction. Automatically sets the\n"
+            "encoder inversion flag in Settings if needed.",
+            self._run_encoder_test)
+
+        self._step_card = self._build_card(container,
+            "Step Response",
+            "Enables PID at 75% of max motor RPM from a standing start\n"
+            "and records the response for 5 seconds. Plots the curve\n"
+            "and suggests PID gain adjustments.",
+            self._run_step_test)
+
+        ttk.Button(container, text="Close",
+                   command=self.destroy).pack(pady=(10, 0))
+
+    def _build_card(self, parent, title, description, run_cmd):
+        card = ttk.LabelFrame(parent, text=title, padding=8)
+        card.pack(fill="x", pady=(0, 8))
+        card.columnconfigure(0, weight=1)
+        ttk.Label(card, text=description, justify="left",
+                  foreground="gray").grid(row=0, column=0, sticky="w")
+        btn = ttk.Button(card, text="▶  Run", width=10,
+                         command=lambda: run_cmd(card))
+        btn.grid(row=0, column=1, padx=(12, 0), sticky="ne")
+        rv = tk.StringVar(value="")
+        rl = ttk.Label(card, textvariable=rv, justify="left", wraplength=380)
+        rl.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        rl.grid_remove()
+        card._btn = btn; card._result_var = rv; card._result_lbl = rl
+        return card
+
+    def _set_result(self, card, text, colour="black"):
+        card._result_var.set(text)
+        card._result_lbl.configure(foreground=colour)
+        card._result_lbl.grid()
+
+    def _run_encoder_test(self, card):
+        app = self._get_app()
+        if not app or not app.serial_port or not app.serial_port.is_open:
+            self._set_result(card, "✗ Not connected", "red")
+            return
+        card._btn.configure(state="disabled", text="Running...")
+        self._set_result(card, "⏳ Spinning motor CW...", "gray")
+        self.update()
+        panel = self.panel
+        panel.motor_in1 = 1; panel.motor_in2 = 0
+        panel.motor_pwm = 120
+        panel.reset_direction_styles()
+        panel.btn_cw.configure(style="ActiveDir.TButton")
+        app.send_command()
+        self.after(800, lambda: self._check_encoder(card, app, panel))
+
+    def _check_encoder(self, card, app, panel):
+        direction = panel.direction_var.get()
+        rpm_text  = panel.shaft_rpm_var.get()
+        panel.motor_in1 = 0; panel.motor_in2 = 0
+        panel.motor_pwm = 0
+        panel.reset_direction_styles()
+        panel.btn_stop.configure(style="ActiveStop.TButton")
+        app.send_command()
+        card._btn.configure(state="normal", text="▶  Run")
+        try:
+            rpm = float(rpm_text)
+        except ValueError:
+            rpm = 0.0
+        if rpm < 50:
+            self._set_result(card,
+                "✗ Motor did not spin — check wiring and motor enable", "red")
+            return
+        motor_key = str(panel.motor_id)
+        if direction == "CW":
+            app.motor_config[motor_key]["encoder_inverted"] = False
+            panel.cfg["encoder_inverted"] = False
+            save_motor_config(app.motor_config)
+            if panel.send_config:
+                panel.send_config(panel.motor_id, debug_enabled=False)
+            self._set_result(card,
+                f"✓ Encoder direction correct  ({rpm:.0f} RPM CW)\n"
+                f"  encoder_inverted set to False and saved", "green")
+        else:
+            app.motor_config[motor_key]["encoder_inverted"] = True
+            panel.cfg["encoder_inverted"] = True
+            save_motor_config(app.motor_config)
+            if panel.send_config:
+                panel.send_config(panel.motor_id, debug_enabled=False)
+            self._set_result(card,
+                f"⚠ Encoder inverted  ({rpm:.0f} RPM showed as {direction})\n"
+                f"  encoder_inverted automatically set to True and saved", "orange")
+
+    def _run_step_test(self, card):
+        StepResponseWindow(self.winfo_toplevel(), self.panel)
+
+    def _get_app(self):
+        """Walk up widget tree to find MotorControlGUI stored on root Tk."""
+        try:
+            root = self.winfo_toplevel()
+            # winfo_toplevel on a Toplevel returns itself — keep going via master
+            w = self
+            while w is not None:
+                if isinstance(w, tk.Tk):
+                    return getattr(w, '_app', None)
+                w = getattr(w, 'master', None)
+        except Exception:
+            pass
+        return None
+
+
+
 class SettingsWindow(tk.Toplevel):
     FIELDS = [
         ("ppr",              "PPR",             "Encoder lines/gaps per motor shaft revolution (datasheet value)", "positive"),
@@ -2061,10 +2606,6 @@ if __name__ == "__main__":
     root = tk.Tk()
     style = ttk.Style(root)
     style.theme_use("clam")
-
-    # Motor panel title — larger bold font
-    style.configure("Motor.TLabelframe",       borderwidth=2)
-    style.configure("Motor.TLabelframe.Label", font=("TkDefaultFont", 12, "bold"))
 
     # Sync button — bold, centred
     style.configure("Sync.TButton",
