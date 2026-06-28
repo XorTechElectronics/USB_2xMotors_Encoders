@@ -1,37 +1,14 @@
- /*
- * MAIN Generated Driver File
- * 
- * @file main.c
- * 
- * @defgroup main MAIN
- * 
- * @brief This is the generated driver implementation file for the MAIN driver.
- *
- * @version MAIN Driver Version 1.0.2
- *
- * @version Package Version: 3.1.2
-*/
-
 /*
-© [2026] Microchip Technology Inc. and its subsidiaries.
+ * MAIN Generated Driver File
+ * XorTech 2-Motor USB CDC Controller
+ * 
+ * Packet protocol:
+ *   Command  (Host->FW): 0x55, 13 bytes
+ *   Config   (Host->FW): 0xBB, 22 bytes  
+ *   RPM      (FW->Host): 0xAA, 14 bytes
+ *   PID Debug(FW->Host): 0xBB, 27 bytes
+ */
 
-    Subject to your compliance with these terms, you may use Microchip 
-    software and any derivatives exclusively with Microchip products. 
-    You are responsible for complying with 3rd party license terms  
-    applicable to your use of 3rd party software (including open source  
-    software) that may accompany Microchip software. SOFTWARE IS ?AS IS.? 
-    NO WARRANTIES, WHETHER EXPRESS, IMPLIED OR STATUTORY, APPLY TO THIS 
-    SOFTWARE, INCLUDING ANY IMPLIED WARRANTIES OF NON-INFRINGEMENT,  
-    MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE. IN NO EVENT 
-    WILL MICROCHIP BE LIABLE FOR ANY INDIRECT, SPECIAL, PUNITIVE, 
-    INCIDENTAL OR CONSEQUENTIAL LOSS, DAMAGE, COST OR EXPENSE OF ANY 
-    KIND WHATSOEVER RELATED TO THE SOFTWARE, HOWEVER CAUSED, EVEN IF 
-    MICROCHIP HAS BEEN ADVISED OF THE POSSIBILITY OR THE DAMAGES ARE 
-    FORESEEABLE. TO THE FULLEST EXTENT ALLOWED BY LAW, MICROCHIP?S 
-    TOTAL LIABILITY ON ALL CLAIMS RELATED TO THE SOFTWARE WILL NOT 
-    EXCEED AMOUNT OF FEES, IF ANY, YOU PAID DIRECTLY TO MICROCHIP FOR 
-    THIS SOFTWARE.
-*/
 #include "mcc_generated_files/system/system.h"
 
 #include <math.h>
@@ -43,12 +20,42 @@
 
 #include "../timer/delay.h"
 
+// Debug output control ? set to 1 to enable UART debug, 0 for production
+#define DEBUG_UART  0
+
+#if DEBUG_UART
+    #define DEBUG_PRINT(s)      UART_PrintString(s)
+    #define DEBUG_PRINTL(s)     UART_PrintString(s); UART_PrintString("\r\n")
+    #define DEBUG_LONG(v)       UART_PrintLong(v)
+    #define DEBUG_NL()          UART_PrintString("\r\n")
+#else
+    #define DEBUG_PRINT(s)
+    #define DEBUG_PRINTL(s)
+    #define DEBUG_LONG(v)
+    #define DEBUG_NL()
+#endif
+
+
 // Each encoder tick fires 4 interrupt on each edge of encA
-    #define QUADRATURE_DECODE  4   // 4x decoding: both edges, both channels
+    #define QUADRATURE_DECODE   4   // 4x decoding: both edges, both channels
 
 // Packet Sizing from the Host to set settings or commands
-    #define CMD_PACKET_SIZE     12
+    #define CMD_PACKET_SIZE     11
     #define CONFIG_PACKET_SIZE  22
+    #define C_BIGGEST_PACKET    22
+
+    // CMD Byte 1 Motor Flags
+        #define FLAG_M01_STBY       (1 << 0)
+
+    // CMD Byte 6 Control flags
+        #define FLAG_M1_PID         (1 << 0)
+        #define FLAG_M2_PID         (1 << 1)
+        #define FLAG_SYNC           (1 << 2)
+
+    // CFG Byte 21 flags
+        #define CONFIG_FLAG_DEBUG_ENABLED    (1 << 0)
+        #define CONFIG_FLAG_ENCODER_INVERTED (1 << 1)
+
 
 // TCA0 underflow timebase for RPM calculation
 // At 24MHz / prescaler 4 / 256 counts = 23,437 Hz overflow rate
@@ -56,6 +63,10 @@
     #define TCA0_OVERFLOW_RATE  23437UL
     #define RPM_WINDOW_MS       100UL
     #define RPM_WINDOW_TICKS    ((TCA0_OVERFLOW_RATE * RPM_WINDOW_MS) / 1000UL)  // 2344
+
+//Sync Gains - how aggressively motor 2 corrects drift
+    #define SYNC_GAIN       0.1f
+    #define SYNC_MAX_RPM 6000.0f    
 
 
 
@@ -82,7 +93,7 @@
     };    
         
     
-//M1_encA_GetValue returns 0x40, depending on port position as a '1' so convert here to pin value
+//M1_encA_GetValue returns something like 0x40, depending on port position as a '1' so convert here to pin value
     static inline uint8_t read_encoder_state_M1(void) {
         uint8_t a = M1_encA_GetValue() ? 1 : 0;
         uint8_t b = M1_encB_GetValue() ? 1 : 0;
@@ -123,10 +134,18 @@
         float    integral_limit;
         uint8_t  max_pwm_step;
         bool     debug_enabled;
+        bool     encoder_inverted;
     } MotorConfig_t;
 
     MotorConfig_t motor_config[2];
     
+// Used to sync encoder rates together
+    volatile bool   sync_directions_opposite    = false;
+    volatile bool   sync_enabled                = false;
+    volatile long   m1_sync_total               = 0;
+    volatile long   m2_sync_total               = 0;    
+
+
 //##############################################################################    
 //SETTINGs and COMMANDs from Host
 //##############################################################################
@@ -137,36 +156,28 @@
     } RxState_t;
 
     RxState_t rx_state        = WAIT_HEADER;
-    uint8_t   rx_buffer[20];  // big enough for largest packet
+    uint8_t   rx_buffer[C_BIGGEST_PACKET];  // big enough for largest packet
     uint8_t   rx_count        = 0;    
 
 //##############################################################################    
 //ISRs    
 //##############################################################################
     // Motor 1 encoder ISR ? triggered on encA's and encB's rising & falling edge
-    void M1_enc_ISR() {    
-        uint8_t new_state   = read_encoder_state_M1();
-        uint8_t index       = (m1_prev_state << 2) | new_state;
-        int8_t delta        = QEM_TABLE[index];
-        motor1_count       += delta;
-                
-        // TEMP DEBUG: send raw values out so we can see the actual sequence
-        //SendDebugBytes(m1_prev_state, new_state, index, delta);  // however you want to get this out ? UART print, USB packet, even just blink a pattern
-                
-        m1_prev_state = new_state;
-    } 
+    void M1_enc_ISR(void) {
+        uint8_t new_state = read_encoder_state_M1();
+        uint8_t index     = (m1_prev_state << 2) | new_state;
+        int8_t  delta     = QEM_TABLE[index];
+        motor1_count     += motor_config[0].encoder_inverted ? -delta : delta;
+        m1_prev_state     = new_state;
+    }
 
     // Motor 2 encoder ISR ? triggered on encA's and encB's rising & falling edge
-    void M2_enc_ISR() {
-        uint8_t new_state   = read_encoder_state_M2();
-        uint8_t index       = (m2_prev_state << 2) | new_state;
-        int8_t delta        = QEM_TABLE[index];
-        motor2_count       += delta;
-                
-        // TEMP DEBUG: send raw values out so we can see the actual sequence
-        //SendDebugBytes(m2_prev_state, new_state, index, delta);  // however you want to get this out ? UART print, USB packet, even just blink a pattern
-                
-        m2_prev_state = new_state;
+    void M2_enc_ISR(void) {
+        uint8_t new_state = read_encoder_state_M2();
+        uint8_t index     = (m2_prev_state << 2) | new_state;
+        int8_t  delta     = QEM_TABLE[index];
+        motor2_count     += motor_config[1].encoder_inverted ? -delta : delta;
+        m2_prev_state     = new_state;
     } 
     
     // ISR ? TCA0 underflow to time the RPM Maths --- keep this as short as possible
@@ -185,72 +196,110 @@
 //##############################################################################       
     void ProcessCommandPacket(uint8_t *buf) {
         // buf[0]  = 0x55 header
-        // buf[1]  = enable flags
-        // buf[2]  = M1 direction bits
+        // buf[1]  = motor flags [bit0=M01_STBY]
+        // buf[2]  = M1 direction
         // buf[3]  = M1 PWM
-        // buf[4]  = M2 direction bits
+        // buf[4]  = M2 direction
         // buf[5]  = M2 PWM
-        // buf[6]  = M1 PID enable
-        // buf[7]  = M1 setpoint high byte  } motor shaft RPM * 10
-        // buf[8]  = M1 setpoint low byte   }
-        // buf[9]  = M2 PID enable
-        // buf[10] = M2 setpoint high byte
-        // buf[11] = M2 setpoint low byte
+        // buf[6]  = control flags [bit0=M1_PID, bit1=M2_PID, bit2=SYNC]
+        // buf[7]  = M1 setpoint high
+        // buf[8]  = M1 setpoint low
+        // buf[9]  = M2 setpoint high
+        // buf[10] = M2 setpoint low
 
         LED0_Toggle();
-        
-        UART_PrintLong((int32_t)buf[0]);  // should print 85 (0x55)
-        UART_PrintLong((int32_t)buf[1]);  // should print 3
-        UART_PrintLong((int32_t)buf[2]);  // should print direction
-        UART_PrintLong((int32_t)buf[3]);  // should print PWM      
 
-        // Enable flags
-        if (buf[1] & (1<<0))    { M01_STBY_SetHigh(); }
-        else                    { M01_STBY_SetLow();  }
+        // Motor enable
+            if (buf[1] & FLAG_M01_STBY) { M01_STBY_SetHigh(); }
+            else                        { M01_STBY_SetLow();  }
 
         // Motor 1 direction
-        if (buf[2] & (1<<0))    { M0_IN1_SetHigh(); } else { M0_IN1_SetLow(); }
-        if (buf[2] & (1<<1))    { M0_IN2_SetHigh(); } else { M0_IN2_SetLow(); }
+            if (buf[2] & (1<<0)) { M0_IN1_SetHigh(); } else { M0_IN1_SetLow(); }
+            if (buf[2] & (1<<1)) { M0_IN2_SetHigh(); } else { M0_IN2_SetLow(); }
 
-        // Motor 1 PWM (manual mode only - ignored if PID enabled)
-        if (!pid[0].enabled)
-            TCA0.SPLIT.LCMP1 = buf[3];
+        // Motor 1 PWM (manual only)
+            if (!pid[0].enabled) TCA0.SPLIT.LCMP1 = buf[3];
 
         // Motor 2 direction
-        if (buf[4] & (1<<0)) { M1_IN1_SetHigh(); } else { M1_IN1_SetLow(); }
-        if (buf[4] & (1<<1)) { M1_IN2_SetHigh(); } else { M1_IN2_SetLow(); }
+            if (buf[4] & (1<<0)) { M1_IN1_SetHigh(); } else { M1_IN1_SetLow(); }
+            if (buf[4] & (1<<1)) { M1_IN2_SetHigh(); } else { M1_IN2_SetLow(); }
 
-        // Motor 2 PWM (manual mode only)
-        if (!pid[1].enabled)
-            TCA0.SPLIT.LCMP0 = buf[5];
+        // Motor 2 PWM (manual only)
+            if (!pid[1].enabled) TCA0.SPLIT.LCMP0 = buf[5];
         
-        // Store previous enabled state before updating
-        bool pid0_was_enabled = pid[0].enabled;
-        bool pid1_was_enabled = pid[1].enabled;        
-
-        // Motor 1 Enable
-        pid[0].enabled      = buf[6];
-
-        // Motor 2 Enable
-        pid[1].enabled      = buf[9];
-               
-        //Setpoints
-        // Cast to uint16_t before shifting ? on 8-bit AVR, uint8_t << 8 overflows to 0
-        pid[0].setpoint_rpm = (float)(((uint16_t)buf[7]  << 8) | buf[8])  / 10.0f;
-        pid[1].setpoint_rpm = (float)(((uint16_t)buf[10] << 8) | buf[11]) / 10.0f;        
-        
+        // Determine if motors are running in opposite directions for sync correction
+        // CW  = IN1 high, IN2 low (buf bit0=1, bit1=0) = dir_byte & 0x03 == 1
+        // CCW = IN1 low, IN2 high (buf bit0=0, bit1=1) = dir_byte & 0x03 == 2
+            uint8_t m1_dir = buf[2] & 0x03;
+            uint8_t m2_dir = buf[4] & 0x03;
+            sync_directions_opposite = (m1_dir != m2_dir) && (m1_dir != 0) && (m2_dir != 0);        
         
         
 
-        // Only zero PWM if PID just transitioned from enabled -> disabled
-        if (pid0_was_enabled && !pid[0].enabled) { TCA0.SPLIT.LCMP1 = 0; pid[0].integral = 0.0f; }
-        if (pid1_was_enabled && !pid[1].enabled) { TCA0.SPLIT.LCMP0 = 0; pid[1].integral = 0.0f; }
-        
-        
-        //Debug...
-        UART_PrintString("M2 PID:"); UART_PrintLong((int32_t)buf[9]);
-        UART_PrintString("M2 SP:");  UART_PrintLong((int32_t)((buf[10] << 8) | buf[11]));        
-    }    
+        // Sync coast-stop ? after direction pins set, before PID update
+        if (sync_enabled && buf[2] == 0x00) {
+            M1_IN1_SetLow(); M1_IN2_SetLow();
+            TCA0.SPLIT.LCMP0  = 0;
+            pid[1].integral   = 0.0f;
+            pid[1].prev_error = 0.0f;
+            m1_sync_total     = 0;
+            m2_sync_total     = 0;
+        }
+
+        // Control flags
+            uint8_t ctrl = buf[6];
+            bool pid0_was_enabled = pid[0].enabled;
+            bool pid1_was_enabled = pid[1].enabled;
+
+        pid[0].enabled = (ctrl & FLAG_M1_PID) != 0;
+        pid[1].enabled = (ctrl & FLAG_M2_PID) != 0;
+
+        // If sync active and Motor 1 PID disabled, kill Motor 2 too
+        if (sync_enabled && !pid[0].enabled) {
+            pid[1].enabled    = false;
+            pid[1].integral   = 0.0f;
+            pid[1].prev_error = 0.0f;
+            TCA0.SPLIT.LCMP0  = 0;
+        }
+
+        // Setpoints
+            pid[0].setpoint_rpm = (float)(((uint16_t)buf[7] << 8) | buf[8])  / 10.0f;
+            pid[1].setpoint_rpm = (float)(((uint16_t)buf[9] << 8) | buf[10]) / 10.0f;
+
+        // Zero PWM on PID disable transition
+        if (pid0_was_enabled && !pid[0].enabled) {
+            TCA0.SPLIT.LCMP1  = 0;
+            pid[0].integral   = 0.0f;
+            pid[0].prev_error = 0.0f;
+        }
+        if (pid1_was_enabled && !pid[1].enabled) {
+            TCA0.SPLIT.LCMP0  = 0;
+            pid[1].integral   = 0.0f;
+            pid[1].prev_error = 0.0f;
+        }
+
+    // Sync enable
+        bool sync_was_enabled = sync_enabled;
+        sync_enabled = (ctrl & FLAG_SYNC) != 0;
+
+        if (sync_enabled && !sync_was_enabled) {
+            m1_sync_total = 0;
+            m2_sync_total = 0;
+        }
+        if (buf[2] == 0x00 || buf[4] == 0x00) {
+            m1_sync_total = 0;
+            m2_sync_total = 0;
+        }
+
+        //DEBUG_PRINT("CMD:");        DEBUG_NL();
+        //DEBUG_PRINT("M1DIR:");      DEBUG_LONG(buf[2]);  DEBUG_NL();
+        //DEBUG_PRINT("M1PWM:");      DEBUG_LONG(buf[3]);  DEBUG_NL();
+        //DEBUG_PRINT("M2DIR:");      DEBUG_LONG(buf[4]);  DEBUG_NL();
+        //DEBUG_PRINT("M2PWM:");      DEBUG_LONG(buf[5]);  DEBUG_NL();
+        //DEBUG_PRINT("CTRL:");       DEBUG_LONG(buf[6]);  DEBUG_NL();
+        //DEBUG_PRINT("M1SP:");       DEBUG_LONG((int32_t)(((uint16_t)buf[7] << 8) | buf[8]));  DEBUG_NL();
+        //DEBUG_PRINT("M2SP:");       DEBUG_LONG((int32_t)(((uint16_t)buf[9] << 8) | buf[10])); DEBUG_NL();
+    }   
     
     void ProcessConfigPacket(uint8_t *buf) {
         // buf[0]     = 0xBB header
@@ -271,7 +320,10 @@
         memcpy(&motor_config[idx].kd,             &buf[12], sizeof(float));
         memcpy(&motor_config[idx].integral_limit, &buf[16], sizeof(float));
         motor_config[idx].max_pwm_step          =  buf[20];
-        motor_config[idx].debug_enabled         = (buf[21] != 0);
+        
+        uint8_t flags                           =  buf[21];
+        motor_config[idx].debug_enabled         = (flags & CONFIG_FLAG_DEBUG_ENABLED)    != 0;
+        motor_config[idx].encoder_inverted      = (flags & CONFIG_FLAG_ENCODER_INVERTED) != 0;
 
         // Update live PID gains immediately
         pid[idx].kp             = motor_config[idx].kp;
@@ -281,15 +333,16 @@
         
         
         // UART dump to confirm received values
-        UART_PrintString("Config Motor:");
-        UART_PrintLong((int32_t)motor_id);
-        UART_PrintString("PPR:");       UART_PrintLong((int32_t) motor_config[idx].ppr);
-        UART_PrintString("Kp*1000:");   UART_PrintLong((int32_t)(motor_config[idx].kp * 1000));
-        UART_PrintString("Ki*1000:");   UART_PrintLong((int32_t)(motor_config[idx].ki * 1000));
-        UART_PrintString("Kd*1000:");   UART_PrintLong((int32_t)(motor_config[idx].kd * 1000));
-        UART_PrintString("Limit:");     UART_PrintLong((int32_t) motor_config[idx].integral_limit);
-        UART_PrintString("Step:");      UART_PrintLong((int32_t) motor_config[idx].max_pwm_step);
-        UART_PrintString("Debug:");     UART_PrintLong((int32_t) motor_config[idx].debug_enabled);        
+        DEBUG_PRINT("Config Motor:");   DEBUG_LONG((int32_t)motor_id);                              DEBUG_NL();  
+        
+        DEBUG_PRINT("PPR:");            DEBUG_LONG((int32_t) motor_config[idx].ppr);                DEBUG_NL(); 
+        DEBUG_PRINT("Kp*1000:");        DEBUG_LONG((int32_t)(motor_config[idx].kp * 1000));         DEBUG_NL(); 
+        DEBUG_PRINT("Ki*1000:");        DEBUG_LONG((int32_t)(motor_config[idx].ki * 1000));         DEBUG_NL(); 
+        DEBUG_PRINT("Kd*1000:");        DEBUG_LONG((int32_t)(motor_config[idx].kd * 1000));         DEBUG_NL(); 
+        DEBUG_PRINT("Limit:");          DEBUG_LONG((int32_t) motor_config[idx].integral_limit);     DEBUG_NL(); 
+        DEBUG_PRINT("Step:");           DEBUG_LONG((int32_t) motor_config[idx].max_pwm_step);       DEBUG_NL(); 
+        DEBUG_PRINT("Inverted:");       DEBUG_LONG((int32_t) motor_config[idx].encoder_inverted);   DEBUG_NL();
+        DEBUG_PRINT("Debug:");          DEBUG_LONG((int32_t) motor_config[idx].debug_enabled);      DEBUG_NL(); 
     }    
     
     
@@ -313,17 +366,18 @@
     }   
     
     void SendRPMDataBinary(int32_t rpm1_x10, int32_t rpm2_x10) {
-        uint8_t packet[9];
-        packet[0] = 0xAA;  // sync byte unchanged
+        uint8_t packet[14];
+        packet[0] = 0xAA;
+        memcpy(&packet[1], &rpm1_x10, sizeof(int32_t));             // bytes 1-4
+        memcpy(&packet[5], &rpm2_x10, sizeof(int32_t));             // bytes 5-8
+        int32_t sync_err = (int32_t)(m1_sync_total - m2_sync_total);
+        memcpy(&packet[9], &sync_err, sizeof(int32_t));             // bytes 9-12
+        packet[13] = sync_enabled ? 1 : 0;                          // byte 13
 
-        memcpy(&packet[1], &rpm1_x10, sizeof(int32_t));
-        memcpy(&packet[5], &rpm2_x10, sizeof(int32_t));
-
-        for (int i = 0; i < 9; i++)
-        {
+        for (int i = 0; i < 14; i++) {
             if (USB_CDCWrite(packet[i]) == CDC_BUFFER_FULL) { }
         }
-    }    
+    } 
     
     void SendDebugBytes(uint8_t prev_state, uint8_t new_state, uint8_t index, int8_t delta) {
         uint8_t packet[5];
@@ -368,8 +422,6 @@
  
     void UART_PrintString(const char *s) {
         while (*s) UART_WriteByte((uint8_t)*s++);
-        //UART_WriteByte('\r');
-        //UART_WriteByte('\n');
     }    
     
     void UART_PrintLong(int32_t value) {
@@ -398,9 +450,6 @@
                 UART_WriteByte((uint8_t)buf[j]);
             }
         }
-
-        UART_WriteByte('\r');
-        UART_WriteByte('\n');
     } 
 
 //##############################################################################    
@@ -426,12 +475,42 @@
         motor1_rpm_x10 = ((long)m1_delta * 6000L) / ( motor_config[0].ppr * QUADRATURE_DECODE );
         motor2_rpm_x10 = ((long)m2_delta * 6000L) / ( motor_config[1].ppr * QUADRATURE_DECODE );
         
-        // PID uses actual RPM (not ×10), unsigned magnitude
-        float m1_rpm = fabsf((float)motor1_rpm_x10 / 10.0f);
-        float m2_rpm = fabsf((float)motor2_rpm_x10 / 10.0f);
-
-        Calculate_PID(&pid[0], m1_rpm, 0);
-        Calculate_PID(&pid[1], m2_rpm, 1);  
+        // Accumulate sync totals
+            m1_sync_total += m1_delta;
+            m2_sync_total += sync_directions_opposite ? -m2_delta : m2_delta;        
+        
+        // Sync ? Motor 2 tracks Motor 1
+        // GUI enforces both start from stopped so no transient issues
+        if (sync_enabled && pid[0].enabled) {
+            long sync_error = m1_sync_total - m2_sync_total;
+            pid[1].setpoint_rpm = pid[0].setpoint_rpm + ((float)sync_error * SYNC_GAIN);
+            
+            if (pid[1].setpoint_rpm < 0.0f)         pid[1].setpoint_rpm = 0.0f;
+            if (pid[1].setpoint_rpm > SYNC_MAX_RPM) pid[1].setpoint_rpm = SYNC_MAX_RPM;
+        }
+        
+#if DEBUG_UART            
+        static uint8_t sync_debug_count = 0;
+        if (sync_enabled) {
+            if (++sync_debug_count >= 10) {
+                sync_debug_count = 0;
+                DEBUG_PRINT("SyncErr:");    DEBUG_LONG(m1_sync_total - m2_sync_total);                  DEBUG_NL();
+                
+                DEBUG_PRINT("M1d:");        DEBUG_LONG(m1_delta);                                       DEBUG_NL();
+                DEBUG_PRINT("M1SP:");       DEBUG_LONG((int32_t)pid[0].setpoint_rpm);                   DEBUG_NL();
+                DEBUG_PRINT("M1RPM:");      DEBUG_LONG((int32_t)(motor1_rpm_x10 / 10));                 DEBUG_NL();
+                DEBUG_PRINT("M1inv:");      DEBUG_LONG((int32_t)motor_config[0].encoder_inverted);      DEBUG_NL();
+                
+                DEBUG_PRINT("M2d:");        DEBUG_LONG(m2_delta);                                       DEBUG_NL();                                
+                DEBUG_PRINT("M2SP:");       DEBUG_LONG((int32_t)pid[1].setpoint_rpm);                   DEBUG_NL();
+                DEBUG_PRINT("M2RPM:");      DEBUG_LONG((int32_t)(motor2_rpm_x10 / 10));                 DEBUG_NL();
+                DEBUG_PRINT("M2inv:");      DEBUG_LONG((int32_t)motor_config[1].encoder_inverted);      DEBUG_NL();
+            }
+        }     
+#endif
+        
+        Calculate_PID(&pid[0], fabsf((float)motor1_rpm_x10 / 10.0f), 0);
+        Calculate_PID(&pid[1], fabsf((float)motor2_rpm_x10 / 10.0f), 1);  
     }    
     
 //##############################################################################    
@@ -512,13 +591,14 @@ int main(void) {
     //Defaults
     // Safe defaults until GUI sends config
     for (uint8_t i = 0; i < 2; i++) {
-        motor_config[i].ppr            = 56;
-        motor_config[i].kp             = 0.0f;
-        motor_config[i].ki             = 0.0f;
-        motor_config[i].kd             = 0.0f;
-        motor_config[i].integral_limit = 255.0f;
-        motor_config[i].max_pwm_step   = 10;
-        motor_config[i].debug_enabled  = false;
+        motor_config[i].ppr                 = 14;
+        motor_config[i].kp                  = 0.0f;
+        motor_config[i].ki                  = 0.0f;
+        motor_config[i].kd                  = 0.0f;
+        motor_config[i].integral_limit      = 255.0f;
+        motor_config[i].max_pwm_step        = 10;
+        motor_config[i].encoder_inverted    = false;
+        motor_config[i].debug_enabled       = false;
 
         pid[i].kp             = 0.0f;
         pid[i].ki             = 0.0f;

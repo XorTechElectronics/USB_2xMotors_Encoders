@@ -49,7 +49,7 @@ KNOWN_VID_PID = [
 
 # --- Encoder packet format ---
 ENCODER_HEADER      = 0xAA
-ENCODER_PACKET_SIZE = 1 + (4 * NUM_MOTORS)  # header + 4 bytes per motor
+ENCODER_PACKET_SIZE = 14   # header(1) + M1_rpm(4) + M2_rpm(4) + sync_err(4) + sync_enabled(1)
 RAW_VALUE_RANGE     = 4294967296             # 2**32 for int32 wraparound
 
 # How often the GUI checks for newly-arrived encoder data.
@@ -84,6 +84,7 @@ DEFAULT_KD               = 0.05
 DEFAULT_INTEGRAL_LIMIT   = 255.0
 DEFAULT_MAX_PWM_STEP     = 10
 DEFAULT_DEBUG_ENABLED    = False
+DEFAULT_ENCODER_INVERTED = False
 
 
 def default_motor_config():
@@ -99,6 +100,7 @@ def default_motor_config():
             "integral_limit":    DEFAULT_INTEGRAL_LIMIT,
             "max_pwm_step":      DEFAULT_MAX_PWM_STEP,
             "debug_enabled":     DEFAULT_DEBUG_ENABLED,
+            "encoder_inverted":  DEFAULT_ENCODER_INVERTED,
         }
         for m in range(1, NUM_MOTORS + 1)
     }
@@ -140,6 +142,7 @@ def load_motor_config():
                 "integral_limit":    _coerce_positive(entry.get("integral_limit"),    defaults["integral_limit"]),
                 "max_pwm_step":      int(_coerce_positive(entry.get("max_pwm_step"),  defaults["max_pwm_step"])),
                 "debug_enabled":     bool(entry.get("debug_enabled",                  defaults["debug_enabled"])),
+                "encoder_inverted":  bool(entry.get("encoder_inverted",               defaults["encoder_inverted"])),
             }
     except (json.JSONDecodeError, OSError):
         pass
@@ -227,11 +230,14 @@ class SerialReader(threading.Thread):
                 packet = bytes(self._buffer[:ENCODER_PACKET_SIZE])
                 del self._buffer[:ENCODER_PACKET_SIZE]
                 try:
-                    values = struct.unpack(f'<{NUM_MOTORS}l', packet[1:])
+                    # bytes 1-4: M1 RPM*10, 5-8: M2 RPM*10, 9-12: sync_err, 13: sync_on
+                    rpm1, rpm2, sync_err = struct.unpack('<3l', packet[1:13])
+                    sync_on = packet[13] != 0
                 except struct.error:
                     continue
-                encoder_values = {m: values[m - 1] for m in range(1, NUM_MOTORS + 1)}
-                self.data_queue.put((time.monotonic(), encoder_values))
+                encoder_values = {1: rpm1, 2: rpm2}
+                self.data_queue.put((time.monotonic(), encoder_values,
+                                     sync_err, sync_on))
 
             elif header == DEBUG_HEADER:
                 if len(self._buffer) < DEBUG_PACKET_SIZE:
@@ -578,6 +584,7 @@ class MotorControlPanel(ttk.LabelFrame):
         self.reset_direction_styles()
         self.btn_stop.configure(style="ActiveStop.TButton")
         self._update_pid_buttons()
+        self.on_motor_stop()
         self.send_command()
 
     def brake_motor(self):
@@ -585,7 +592,13 @@ class MotorControlPanel(ttk.LabelFrame):
         self.reset_direction_styles()
         self.btn_brake.configure(style="ActiveBrake.TButton")
         self._update_pid_buttons()
+        self.on_motor_stop()
         self.send_command()
+
+    def on_motor_stop(self):
+        """Called when stop or brake is pressed — GUI hooks this to
+        stop Motor 2 when sync is active."""
+        pass  # overridden by MotorControlGUI after panel creation
 
     # ------------------------------------------------------------------
     # PID setpoint controls
@@ -602,6 +615,11 @@ class MotorControlPanel(ttk.LabelFrame):
             return float(self.vel_sp_entry_var.get())
         except ValueError:
             return 0.0
+
+    def on_setpoint_change(self):
+        """Called when this panel's setpoint changes — GUI hooks this
+        to mirror Motor 1 setpoint to Motor 2 when sync is active."""
+        pass  # overridden by MotorControlGUI after panel creation
 
     def motor_shaft_setpoint(self):
         """Return motor shaft RPM setpoint for firmware.
@@ -632,6 +650,7 @@ class MotorControlPanel(ttk.LabelFrame):
         v = round(float(val), 1)
         self.output_sp_entry_var.set(f"{v:.1f}")
         self.output_sp_var.set(v)
+        self.on_setpoint_change()
         if self.output_pid_enabled:
             self.velocity_pid_enabled = False
             self._update_pid_buttons()
@@ -643,6 +662,7 @@ class MotorControlPanel(ttk.LabelFrame):
             v = max(0.0, min(v, self.output_sp_slider.cget("to")))
             self.output_sp_entry_var.set(f"{v:.1f}")
             self.output_sp_var.set(v)
+            self.on_setpoint_change()
             if self.output_pid_enabled:
                 self.velocity_pid_enabled = False
                 self._update_pid_buttons()
@@ -654,6 +674,7 @@ class MotorControlPanel(ttk.LabelFrame):
         v = float(val)
         self.vel_sp_entry_var.set(f"{v:.3f}")
         self.vel_sp_var.set(v)
+        self.on_setpoint_change()
         if self.velocity_pid_enabled:
             self.output_pid_enabled = False
             self._update_pid_buttons()
@@ -665,6 +686,7 @@ class MotorControlPanel(ttk.LabelFrame):
             v = max(0.0, min(v, self.vel_sp_slider.cget("to")))
             self.vel_sp_entry_var.set(f"{v:.3f}")
             self.vel_sp_var.set(v)
+            self.on_setpoint_change()
             if self.velocity_pid_enabled:
                 self.output_pid_enabled = False
                 self._update_pid_buttons()
@@ -677,10 +699,10 @@ class MotorControlPanel(ttk.LabelFrame):
         if self.output_pid_enabled:
             self.velocity_pid_enabled = False
         else:
-            # Restore manual control at a safe mid-range speed
             self.speed_var.set(128)
             self.motor_pwm = 128
         self._update_pid_buttons()
+        self.on_pid_change()
         self.send_command()
 
     def toggle_velocity_pid(self):
@@ -688,11 +710,16 @@ class MotorControlPanel(ttk.LabelFrame):
         if self.velocity_pid_enabled:
             self.output_pid_enabled = False
         else:
-            # Restore manual control at a safe mid-range speed
             self.speed_var.set(128)
             self.motor_pwm = 128
         self._update_pid_buttons()
+        self.on_pid_change()
         self.send_command()
+
+    def on_pid_change(self):
+        """Called when PID is enabled/disabled — GUI hooks this to
+        lock direction controls during sync."""
+        pass  # overridden by MotorControlGUI after panel creation
 
     def _open_pid_tuning(self):
         """Open (or refocus) the PID tuning window for this motor."""
@@ -1369,6 +1396,7 @@ class SettingsWindow(tk.Toplevel):
         self.on_save = on_save
         self.transient(parent)
         self.entries = {}
+        self._current_config = current_config  # preserved for merge on save
 
         container = ttk.Frame(self, padding=12)
         container.pack(fill="both", expand=True)
@@ -1403,6 +1431,24 @@ class SettingsWindow(tk.Toplevel):
                 row=r, column=NUM_MOTORS + 1, padx=(8, 0), sticky="w")
 
         last_row = len(self.FIELDS) + 2
+
+        # Encoder inversion — checkbox per motor
+        ttk.Label(container, text="Encoder Inverted", anchor="w").grid(
+            row=last_row, column=0, padx=(0, 10), pady=3, sticky="w")
+        self._invert_vars = {}
+        for idx, motor_id in enumerate(range(1, NUM_MOTORS + 1)):
+            motor_key = str(motor_id)
+            val = current_config.get(motor_key, {}).get(
+                "encoder_inverted", default_motor_config()[motor_key]["encoder_inverted"])
+            var = tk.BooleanVar(value=bool(val))
+            ttk.Checkbutton(container, variable=var).grid(
+                row=last_row, column=idx + 1, padx=5, pady=3)
+            self._invert_vars[motor_key] = var
+        ttk.Label(container, text="Invert encoder direction if CW shows as CCW",
+                  foreground="gray", font=("TkDefaultFont", 8)).grid(
+            row=last_row, column=NUM_MOTORS + 1, padx=(8, 0), sticky="w")
+        last_row += 1
+
         self.error_var = tk.StringVar(value="")
         ttk.Label(container, textvariable=self.error_var, foreground="red").grid(
             row=last_row, column=0, columnspan=NUM_MOTORS + 2, pady=(6, 0))
@@ -1417,7 +1463,11 @@ class SettingsWindow(tk.Toplevel):
     def _save(self):
         new_config = {}
         for motor_key in self.entries:
-            cfg = {}
+            # Start from existing full config so PID gains and other fields
+            # not shown in Settings (saved by PIDTuningWindow) are preserved
+            cfg = dict(self._current_config.get(
+                motor_key, default_motor_config()[motor_key]))
+
             for key, label, hint, coerce in self.FIELDS:
                 raw = self.entries[motor_key][key].get()
                 try:
@@ -1431,6 +1481,8 @@ class SettingsWindow(tk.Toplevel):
                     rule = "positive number" if coerce == "positive" else "non-negative number"
                     self.error_var.set(f"Motor {motor_key} — {label}: must be a {rule}.")
                     return
+            # Add boolean fields
+            cfg["encoder_inverted"] = self._invert_vars[motor_key].get()
             new_config[motor_key] = cfg
         if save_motor_config(new_config):
             self.on_save(new_config)
@@ -1457,6 +1509,7 @@ class MotorControlGUI:
 
         self._last_raw_value    = {m: None for m in range(1, NUM_MOTORS + 1)}
         self._last_packet_time  = {m: None for m in range(1, NUM_MOTORS + 1)}
+        self._sync_enabled      = False
 
         # --- Connection controls ---
         detect_frame = ttk.Frame(root)
@@ -1468,6 +1521,14 @@ class MotorControlGUI:
         ttk.Button(detect_frame, text="Refresh Ports", command=self.refresh_ports).pack(side="left", padx=5)
         ttk.Button(detect_frame, text="Connect",       command=self.connect_selected_port).pack(side="left", padx=5)
         ttk.Button(detect_frame, text="Settings...",   command=self.open_settings).pack(side="left", padx=5)
+
+        self.btn_sync = ttk.Button(detect_frame, text="🔗 Sync",
+                                   command=self.toggle_sync, state="disabled")
+        self.btn_sync.pack(side="left", padx=5)
+
+        self.sync_status_var = tk.StringVar(value="")
+        ttk.Label(detect_frame, textvariable=self.sync_status_var,
+                  foreground="green").pack(side="left", padx=5)
 
         self.status_label = ttk.Label(root, text="Status: Not connected")
         self.status_label.pack(pady=5)
@@ -1487,7 +1548,134 @@ class MotorControlGUI:
             panel.apply_config(cfg)
             self.motor_frames.append(panel)
 
+        # When Motor 1 setpoint changes and sync is active, mirror to Motor 2
+        def _m1_setpoint_changed():
+            if self._sync_enabled and len(self.motor_frames) >= 2:
+                self._apply_sync_to_motor2()
+        self.motor_frames[0].on_setpoint_change = _m1_setpoint_changed
+
+        # When Motor 1 PID enables/disables during sync, lock/unlock direction controls
+        def _m1_pid_changed():
+            if self._sync_enabled:
+                m1 = self.motor_frames[0]
+                m2 = self.motor_frames[1]
+                pid_active = m1.output_pid_enabled or m1.velocity_pid_enabled
+                state = "disabled" if pid_active else "normal"
+                for panel in [m1, m2]:
+                    panel.btn_cw   .configure(state=state)
+                    panel.btn_ccw  .configure(state=state)
+                    panel.btn_stop .configure(state="normal")  # stop always available
+                    panel.btn_brake.configure(state=state)
+                    panel.speed_slider.configure(state=state)
+        self.motor_frames[0].on_pid_change = _m1_pid_changed
+        def _m1_motor_stopped():
+            if self._sync_enabled and len(self.motor_frames) >= 2:
+                m2 = self.motor_frames[1]
+                m2.motor_in1 = 0
+                m2.motor_in2 = 0
+                m2.output_pid_enabled   = False
+                m2.velocity_pid_enabled = False
+                m2.reset_direction_styles()
+                m2.btn_stop.configure(style="ActiveStop.TButton")
+                m2._update_pid_buttons()
+                # Disable sync — clean state for next run
+                self._sync_enabled = False
+                self._restore_motor2_controls()
+                self._update_sync_button()
+        self.motor_frames[0].on_motor_stop = _m1_motor_stopped
+
         self.root.after(POLL_INTERVAL_MS, self._poll_encoder_queue)
+
+    def toggle_sync(self):
+        self._sync_enabled = not self._sync_enabled
+        if self._sync_enabled:
+            # Sync just enabled — grey out Motor 2 PID controls
+            # and mirror Motor 1's setpoint to Motor 2
+            self._apply_sync_to_motor2()
+        else:
+            # Sync disabled — restore Motor 2 controls
+            self._restore_motor2_controls()
+        self._update_sync_button()
+        self.send_command()
+
+    def _apply_sync_to_motor2(self):
+        """When sync enables, copy Motor 1's setpoint and PID state
+        to Motor 2 and lock controls on both motors."""
+        m1 = self.motor_frames[0]
+        m2 = self.motor_frames[1]
+
+        # Mirror Motor 1's PID mode and setpoint to Motor 2
+        m2.output_pid_enabled   = m1.output_pid_enabled
+        m2.velocity_pid_enabled = m1.velocity_pid_enabled
+        m2.output_sp_var.set(m1.output_sp_var.get())
+        m2.output_sp_entry_var.set(m1.output_sp_entry_var.get())
+        m2.vel_sp_var.set(m1.vel_sp_var.get())
+        m2.vel_sp_entry_var.set(m1.vel_sp_entry_var.get())
+        m2._update_pid_buttons()
+
+        # Lock Motor 2 setpoint and PID controls
+        m2.output_sp_slider.configure(state="disabled")
+        m2.vel_sp_slider.configure(state="disabled")
+        m2.btn_output_pid.configure(state="disabled")
+        m2.btn_vel_pid.configure(state="disabled")
+
+        # Lock direction and speed controls on BOTH motors during sync
+        # only once PID is active — before PID starts, direction can still
+        # be set (motors aren't moving yet so it's safe)
+        m1_pid_active = m1.output_pid_enabled or m1.velocity_pid_enabled
+        if m1_pid_active:
+            for panel in [m1, m2]:
+                panel.btn_cw   .configure(state="disabled")
+                panel.btn_ccw  .configure(state="disabled")
+                panel.btn_stop .configure(state="disabled")
+                panel.btn_brake.configure(state="disabled")
+                panel.speed_slider.configure(state="disabled")
+
+    def _restore_motor2_controls(self):
+        """Restore all controls when sync is disabled."""
+        m1 = self.motor_frames[0]
+        m2 = self.motor_frames[1]
+
+        # Restore Motor 2 setpoint and PID controls
+        m2.output_sp_slider.configure(state="normal")
+        m2.btn_output_pid.configure(state="normal")
+        m2._refresh_velocity_state()
+
+        # Restore direction and speed controls on both motors
+        for panel in [m1, m2]:
+            panel.btn_cw   .configure(state="normal")
+            panel.btn_ccw  .configure(state="normal")
+            panel.btn_stop .configure(state="normal")
+            panel.btn_brake.configure(state="normal")
+            panel.speed_slider.configure(state="normal")
+
+    def _update_sync_button(self):
+        """Sync is available when both motors are stopped (coast)
+        and both PIDs are disabled — clean starting condition."""
+        connected = self.serial_port and self.serial_port.is_open
+
+        both_stopped = all(
+            p.motor_in1 == 0 and p.motor_in2 == 0
+            for p in self.motor_frames)
+        both_pid_off = all(
+            not p.output_pid_enabled and not p.velocity_pid_enabled
+            for p in self.motor_frames)
+
+        # Can enable sync when stopped and PIDs off, or when already synced
+        can_sync = connected and (both_stopped and both_pid_off or self._sync_enabled)
+
+        self.btn_sync.configure(state="normal" if can_sync else "disabled")
+
+        if not can_sync and self._sync_enabled:
+            # Lost sync condition — disable cleanly
+            self._sync_enabled = False
+            self._restore_motor2_controls()
+
+        if self._sync_enabled:
+            self.btn_sync.configure(text="🔗 Synced", style="ActiveDir.TButton")
+        else:
+            self.btn_sync.configure(text="🔗 Sync", style="TButton")
+            self.sync_status_var.set("")
 
     # ------------------------------------------------------------------
     # Settings
@@ -1576,10 +1764,11 @@ class MotorControlGUI:
             # Reset firmware to a known stopped state so it matches
             # the GUI's freshly initialised panel defaults.
             stop_packet = bytes([0x55, 0x03,
-                                 0x00, 0x00,       # M1 coast, PWM 0
-                                 0x00, 0x00,       # M2 coast, PWM 0
-                                 0x00, 0x00, 0x00, # M1 PID off, setpoint 0
-                                 0x00, 0x00, 0x00])# M2 PID off, setpoint 0
+                                 0x00, 0x00,  # M1 coast, PWM 0
+                                 0x00, 0x00,  # M2 coast, PWM 0
+                                 0x00,        # ctrl flags: all off
+                                 0x00, 0x00,  # M1 setpoint 0
+                                 0x00, 0x00]) # M2 setpoint 0
             self.serial_port.write(stop_packet)
 
             self.root.after(200, self.send_all_config)
@@ -1605,7 +1794,19 @@ class MotorControlGUI:
         except queue.Empty:
             pass
 
-        for latest_ts, latest in packets:
+        for latest_ts, latest, sync_err, sync_on in packets:
+            # Update sync status display
+            if sync_on:
+                if abs(sync_err) < 5:
+                    self.sync_status_var.set("✓ Synced")
+                else:
+                    self.sync_status_var.set(f"Syncing... ({sync_err:+d})")
+            else:
+                self.sync_status_var.set("")
+
+            # Also refresh sync button state in case PID was enabled/disabled
+            self._update_sync_button()
+
             for panel in self.motor_frames:
                 if panel.motor_id not in latest:
                     continue
@@ -1664,33 +1865,59 @@ class MotorControlGUI:
     # ------------------------------------------------------------------
 
     def send_command(self):
-        # 12-byte command packet:
-        # [0x55, enable, M1_dir, M1_pwm, M2_dir, M2_pwm,
-        #  M1_pid_en, M1_sp_hi, M1_sp_lo,
-        #  M2_pid_en, M2_sp_hi, M2_sp_lo]
-        cdcdata = [0x55, 0x03] + [0] * 10
+        # 11-byte command packet:
+        # Byte 0:  0x55 header
+        # Byte 1:  motor flags [bit0=M01_STBY]
+        # Byte 2:  M1 direction [bit0=IN1, bit1=IN2]
+        # Byte 3:  M1 PWM (manual mode)
+        # Byte 4:  M2 direction
+        # Byte 5:  M2 PWM (manual mode)
+        # Byte 6:  control flags [bit0=M1_PID, bit1=M2_PID, bit2=SYNC]
+        # Byte 7:  M1 setpoint high byte  } motor shaft RPM×10 as uint16
+        # Byte 8:  M1 setpoint low byte   }
+        # Byte 9:  M2 setpoint high byte
+        # Byte 10: M2 setpoint low byte
+        cdcdata = [0x55, 0x03] + [0] * 9  # 11 bytes
 
+        # Direction and PWM bytes (unchanged positions)
         for panel in self.motor_frames:
             motor_id = panel.motor_id
             dir_byte = (panel.motor_in1 * 1) + (panel.motor_in2 * 2)
-            cdcdata[motor_id * 2]       = dir_byte
-            cdcdata[(motor_id * 2) + 1] = panel.motor_pwm
+            cdcdata[motor_id * 2]       = dir_byte   # bytes 2, 4
+            cdcdata[(motor_id * 2) + 1] = panel.motor_pwm  # bytes 3, 5
 
-            pid_active = panel.output_pid_enabled or panel.velocity_pid_enabled
-            raw_sp = panel.motor_shaft_setpoint() * 10
+        # Control flags byte 6
+        m1 = self.motor_frames[0]
+        m2 = self.motor_frames[1]
+        m1_pid = m1.output_pid_enabled or m1.velocity_pid_enabled
+        # When sync active, Motor 2 PID mirrors Motor 1
+        m2_pid = m1_pid if self._sync_enabled else (m2.output_pid_enabled or m2.velocity_pid_enabled)
+
+        ctrl = 0
+        if m1_pid:              ctrl |= (1 << 0)  # FLAG_M1_PID
+        if m2_pid:              ctrl |= (1 << 1)  # FLAG_M2_PID
+        if self._sync_enabled:  ctrl |= (1 << 2)  # FLAG_SYNC
+        cdcdata[6] = ctrl
+
+        # Setpoints — bytes 7-10
+        for panel in self.motor_frames:
+            motor_id = panel.motor_id
+            if self._sync_enabled and motor_id == 2:
+                # Sync active — Motor 2 mirrors Motor 1 setpoint
+                raw_sp = m1.motor_shaft_setpoint() * 10
+            else:
+                raw_sp = panel.motor_shaft_setpoint() * 10
             setpoint_x10 = int(max(0.0, min(raw_sp, 65535.0)))
-            sp_hi = (setpoint_x10 >> 8) & 0xFF
-            sp_lo =  setpoint_x10       & 0xFF
-            base = 6 + (motor_id - 1) * 3
-            cdcdata[base]     = 1 if pid_active else 0
-            cdcdata[base + 1] = sp_hi
-            cdcdata[base + 2] = sp_lo
+            base = 5 + (motor_id * 2)  # M1→7,8  M2→9,10
+            cdcdata[base]     = (setpoint_x10 >> 8) & 0xFF
+            cdcdata[base + 1] =  setpoint_x10       & 0xFF
 
         print(printHex(cdcdata))
 
         if self.serial_port and self.serial_port.is_open:
             try:
                 self.serial_port.write(bytes(cdcdata))
+                self._update_sync_button()
                 for panel in self.motor_frames:
                     if panel.motor_in1 == 0 and panel.motor_in2 == 0:
                         self._last_packet_time[panel.motor_id] = None
@@ -1714,7 +1941,13 @@ class MotorControlGUI:
         struct.pack_into('<f', packet, 12, float(cfg.get('kd',            defaults['kd'])))
         struct.pack_into('<f', packet, 16, float(cfg.get('integral_limit',defaults['integral_limit'])))
         packet[20] = int(max(1, min(255, cfg.get('max_pwm_step', defaults['max_pwm_step']))))
-        packet[21] = 1 if debug_enabled else 0
+
+        # Byte 21: flags byte
+        # bit 0 = debug_enabled, bit 1 = encoder_inverted
+        flags = 0
+        if debug_enabled:                              flags |= (1 << 0)
+        if cfg.get('encoder_inverted', False):         flags |= (1 << 1)
+        packet[21] = flags
 
         if self.serial_port and self.serial_port.is_open:
             try:
@@ -1732,14 +1965,16 @@ class MotorControlGUI:
         # Stop all motors before closing
         if self.serial_port and self.serial_port.is_open:
             try:
-                # Send a stop command — all motors coast, PID disabled, PWM 0
-                stop_packet = [0x55, 0x03,
-                               0x00, 0x00,  # M1 coast, PWM 0
-                               0x00, 0x00,  # M2 coast, PWM 0
-                               0x00, 0x00, 0x00,  # M1 PID off, setpoint 0
-                               0x00, 0x00, 0x00]  # M2 PID off, setpoint 0
-                self.serial_port.write(bytes(stop_packet))
-                time.sleep(0.05)  # give firmware time to process
+                # Send a stop command — all motors coast, PID disabled,
+                # PWM 0, sync off. Must be 11 bytes to match CMD_PACKET_SIZE.
+                stop_packet = bytes([0x55, 0x03,
+                                     0x00, 0x00,  # M1 coast, PWM 0
+                                     0x00, 0x00,  # M2 coast, PWM 0
+                                     0x00,        # ctrl flags: all off
+                                     0x00, 0x00,  # M1 setpoint 0
+                                     0x00, 0x00]) # M2 setpoint 0
+                self.serial_port.write(stop_packet)
+                time.sleep(0.1)  # give firmware time to process
             except serial.SerialException:
                 pass
         self._stop_reader()

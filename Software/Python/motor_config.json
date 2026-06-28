@@ -2,25 +2,27 @@
   "1": {
     "ppr": 14.0,
     "gear_ratio": 50.0,
-    "max_motor_rpm": 6000.0,
+    "max_motor_rpm": 120.0,
     "wheel_diameter_mm": 50.0,
     "kp": 0.05,
     "ki": 0.02,
     "kd": 0.0,
     "integral_limit": 10000.0,
     "max_pwm_step": 10,
-    "debug_enabled": false
+    "debug_enabled": false,
+    "encoder_inverted": true
   },
   "2": {
     "ppr": 14.0,
     "gear_ratio": 50.0,
-    "max_motor_rpm": 6000.0,
+    "max_motor_rpm": 120.0,
     "wheel_diameter_mm": 50.0,
     "kp": 0.05,
     "ki": 0.02,
     "kd": 0.0,
     "integral_limit": 10000.0,
     "max_pwm_step": 10,
-    "debug_enabled": false
+    "debug_enabled": false,
+    "encoder_inverted": true
   }
 }
