@@ -76,7 +76,7 @@ def printHex(data):
 
 DEFAULT_PPR              = 14
 DEFAULT_GEAR_RATIO       = 50.0
-DEFAULT_MAX_MOTOR_RPM    = 6000.0
+DEFAULT_MAX_OUTPUT_RPM   = 120.0
 DEFAULT_WHEEL_DIAMETER   = 0.0
 DEFAULT_KP               = 0.5
 DEFAULT_KI               = 0.1
@@ -92,7 +92,7 @@ def default_motor_config():
         str(m): {
             "ppr":               DEFAULT_PPR,
             "gear_ratio":        DEFAULT_GEAR_RATIO,
-            "max_motor_rpm":     DEFAULT_MAX_MOTOR_RPM,
+            "max_output_rpm":    DEFAULT_MAX_OUTPUT_RPM,
             "wheel_diameter_mm": DEFAULT_WHEEL_DIAMETER,
             "kp":                DEFAULT_KP,
             "ki":                DEFAULT_KI,
@@ -134,7 +134,7 @@ def load_motor_config():
             config[motor_key] = {
                 "ppr":               _coerce_positive(entry.get("ppr"),               defaults["ppr"]),
                 "gear_ratio":        _coerce_positive(entry.get("gear_ratio"),        defaults["gear_ratio"]),
-                "max_motor_rpm":     _coerce_positive(entry.get("max_motor_rpm"),     defaults["max_motor_rpm"]),
+                "max_output_rpm":    _coerce_positive(entry.get("max_output_rpm") or entry.get("max_motor_rpm"), defaults["max_output_rpm"]),
                 "wheel_diameter_mm": _coerce_nonneg  (entry.get("wheel_diameter_mm"), defaults["wheel_diameter_mm"]),
                 "kp":                _coerce_nonneg  (entry.get("kp"),                defaults["kp"]),
                 "ki":                _coerce_nonneg  (entry.get("ki"),                defaults["ki"]),
@@ -334,7 +334,7 @@ class MotorControlPanel(ttk.Frame):
         # Current config (updated by GUI when settings change)
         self.cfg = {
             "gear_ratio":        DEFAULT_GEAR_RATIO,
-            "max_motor_rpm":     DEFAULT_MAX_MOTOR_RPM,
+            "max_output_rpm":    DEFAULT_MAX_OUTPUT_RPM,
             "wheel_diameter_mm": DEFAULT_WHEEL_DIAMETER,
         }
 
@@ -574,7 +574,7 @@ class MotorControlPanel(ttk.Frame):
 
     def apply_config(self, cfg):
         self.cfg = cfg
-        max_output = cfg["max_motor_rpm"] / max(cfg["gear_ratio"], 0.001)
+        max_output = cfg.get("max_output_rpm", DEFAULT_MAX_OUTPUT_RPM)
         self.output_sp_slider.configure(to=max_output)
         wheel = cfg["wheel_diameter_mm"]
         if wheel > 0:
@@ -1443,7 +1443,7 @@ class StepResponseWindow(tk.Toplevel):
     with PID enabled, records 50 samples (5 seconds), plots the
     response curve and suggests PID gain adjustments.
     """
-    SAMPLES  = 50
+    SAMPLES  = 100   # 10 seconds at 10Hz — enough for slow integral wind-up
     TEST_PCT = 0.75
 
     def __init__(self, parent, panel):
@@ -1465,7 +1465,7 @@ class StepResponseWindow(tk.Toplevel):
         ttk.Label(container,
                   text=f"Runs Motor {self.panel.motor_id} from stopped to "
                        f"{int(self.TEST_PCT*100)}% of max RPM with PID enabled.\n"
-                       f"Records {self.SAMPLES} samples (~5 seconds) then stops automatically.",
+                       f"Records {self.SAMPLES} samples (~10 seconds) then stops automatically.",
                   justify="left", foreground="gray").pack(anchor="w")
 
         ctrl = ttk.Frame(container)
@@ -1475,6 +1475,33 @@ class StepResponseWindow(tk.Toplevel):
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(ctrl, textvariable=self.status_var,
                   foreground="gray").pack(side="left", padx=10)
+
+        # Current PID gains — editable so user can tweak and apply directly
+        gains_frame = ttk.LabelFrame(container, text="Current PID Gains")
+        gains_frame.pack(fill="x", pady=(6, 0))
+        gains_frame.columnconfigure((0,1,2,3,4), weight=1)
+        self._gains_display_vars = {}
+        for col, (key, label) in enumerate([
+            ("kp",             "Kp"),
+            ("ki",             "Ki"),
+            ("kd",             "Kd"),
+            ("integral_limit", "Int. Limit"),
+            ("max_pwm_step",   "PWM Step"),
+        ]):
+            f = ttk.Frame(gains_frame)
+            f.grid(row=0, column=col, padx=6, pady=4, sticky="ew")
+            ttk.Label(f, text=label, font=("TkDefaultFont", 8),
+                      foreground="gray", anchor="center").pack()
+            var = tk.StringVar(value="--")
+            ttk.Entry(f, textvariable=var, width=8,
+                      justify="center").pack()
+            self._gains_display_vars[key] = var
+
+        apply_gains_btn = ttk.Button(gains_frame, text="Apply Gains",
+                                     command=self._apply_manual_gains)
+        apply_gains_btn.grid(row=1, column=0, columnspan=5,
+                             pady=(2, 6))
+        self._refresh_gains_display()
 
         plot_frame = ttk.LabelFrame(container, text="Response Curve")
         plot_frame.pack(fill="x", pady=(8, 0))
@@ -1506,7 +1533,7 @@ class StepResponseWindow(tk.Toplevel):
         sf.pack(fill="x", pady=(8, 0))
         sf.columnconfigure(0, weight=1)
         self._sugg_rows = []
-        for i in range(3):
+        for i in range(4):
             var = tk.StringVar(value="")
             lbl = ttk.Label(sf, textvariable=var, justify="left", wraplength=360)
             lbl.grid(row=i, column=0, sticky="w", padx=8, pady=2)
@@ -1515,12 +1542,16 @@ class StepResponseWindow(tk.Toplevel):
                              command=lambda h=ah: h[0]() if h[0] else None)
             btn.grid(row=i, column=1, padx=(4, 8), pady=2)
             btn.grid_remove()
-            self._sugg_rows.append((var, btn, ah))
+            self._sugg_rows.append((var, lbl, btn, ah))
 
         bf = ttk.Frame(container)
         bf.pack(pady=(8, 0))
-        ttk.Button(bf, text="Export CSV", command=self._export_csv).pack(side="left", padx=5)
-        ttk.Button(bf, text="Close", command=self._on_close).pack(side="left", padx=5)
+        ttk.Button(bf, text="Save Gains",
+                   command=self._save_gains).pack(side="left", padx=5)
+        ttk.Button(bf, text="Export CSV",
+                   command=self._export_csv).pack(side="left", padx=5)
+        ttk.Button(bf, text="Close",
+                   command=self._on_close).pack(side="left", padx=5)
 
     def _run_test(self):
         app = self._get_app()
@@ -1528,15 +1559,19 @@ class StepResponseWindow(tk.Toplevel):
         if not app or not app.serial_port or not app.serial_port.is_open:
             self.status_var.set("Not connected")
             return
-        cfg = self.panel.cfg
-        max_rpm = cfg.get("max_motor_rpm", DEFAULT_MAX_MOTOR_RPM)
-        self._setpoint = max_rpm * self.TEST_PCT
-        self._samples  = []
-        self._running  = True
+        cfg     = self.panel.cfg
+        gear    = cfg.get("gear_ratio", 1.0)
+        # max_output_rpm is output shaft RPM — convert to motor shaft for setpoint
+        max_output_rpm   = cfg.get("max_output_rpm", DEFAULT_MAX_OUTPUT_RPM)
+        max_motor_shaft  = max_output_rpm * gear if gear > 0 else max_output_rpm
+        self._setpoint   = max_motor_shaft * self.TEST_PCT  # motor shaft RPM
+        output_sp        = self._setpoint / gear if gear > 0 else self._setpoint
+        self._samples    = []
+        self._running    = True
         self.btn_run.configure(state="disabled", text="Running...")
         self.status_var.set("Starting motor...")
         self.canvas.delete("all")
-        for var, btn, _ in self._sugg_rows:
+        for var, lbl, btn, _ in self._sugg_rows:
             var.set(""); btn.grid_remove()
         for var in self._metric_vars.values():
             var.set("--")
@@ -1548,14 +1583,12 @@ class StepResponseWindow(tk.Toplevel):
         panel.btn_cw.configure(style="ActiveDir.TButton")
         panel.output_pid_enabled   = True
         panel.velocity_pid_enabled = False
-        gear = cfg.get("gear_ratio", 1.0)
-        output_sp = self._setpoint / gear if gear > 0 else self._setpoint
         panel.output_sp_var.set(output_sp)
         panel.output_sp_entry_var.set(f"{output_sp:.1f}")
         panel._update_pid_buttons()
         if panel.send_config:
             panel.send_config(panel.motor_id, debug_enabled=True)
-        print(f"StepTest sending: motor_in1={panel.motor_in1} motor_in2={panel.motor_in2} pid={panel.output_pid_enabled} sp={panel.output_sp_entry_var.get()}")
+        print(f"StepTest: setpoint={self._setpoint:.0f} motor shaft RPM ({output_sp:.1f} output shaft RPM)")
         app.send_command()
         self.status_var.set(f"Recording... (0/{self.SAMPLES})")
         self.after(100, self._collect_sample)
@@ -1607,7 +1640,9 @@ class StepResponseWindow(tk.Toplevel):
         P = {"l": 44, "r": 10, "t": 10, "b": 25}
         pw = W - P["l"] - P["r"]
         ph = H - P["t"] - P["b"]
-        max_rpm = self.panel.cfg.get("max_motor_rpm", DEFAULT_MAX_MOTOR_RPM)
+        max_rpm_out = self.panel.cfg.get("max_output_rpm", DEFAULT_MAX_OUTPUT_RPM)
+        gear_r = self.panel.cfg.get("gear_ratio", 1.0)
+        max_rpm = max_rpm_out * gear_r
         for i in range(5):
             y = P["t"] + int(ph * i / 4)
             self.canvas.create_line(P["l"], y, W - P["r"], y,
@@ -1621,7 +1656,7 @@ class StepResponseWindow(tk.Toplevel):
             self.canvas.create_line(x, P["t"], x, H - P["b"],
                                     fill="#333", dash=(2, 4))
             self.canvas.create_text(x, H - P["b"] + 8,
-                                    text=f"{i}s", fill="#888",
+                                    text=f"{i*2}s", fill="#888",
                                     font=("TkDefaultFont", 7))
         sp_y = P["t"] + int(ph * (1 - self._setpoint / max_rpm))
         self.canvas.create_line(P["l"], sp_y, W - P["r"], sp_y,
@@ -1697,6 +1732,7 @@ class StepResponseWindow(tk.Toplevel):
         sp      = self._setpoint
         band    = sp * 0.05
         n       = len(samples)
+        cfg     = self.panel.cfg
         if n < 5 or sp <= 0:
             return
         rise_i = next((i for i, r in enumerate(samples) if r >= sp * 0.9), None)
@@ -1708,11 +1744,16 @@ class StepResponseWindow(tk.Toplevel):
             for i in range(rise_i, n):
                 if abs(samples[i] - sp) > band:
                     settling_i = i
-        settling_s = (settling_i + 1) * 0.1 if settling_i else rise_s
+        settling_s = (settling_i + 1) * 0.1 if settling_i and settling_i < n - 1 else None
         steady_err = abs(sp - sum(samples[-10:]) / 10) if n >= 10 else None
+        # Oscillations — sign changes of error after crossing, ignoring
+        # small fluctuations within the ±5% settling band
         if rise_i is not None:
             diffs = [s - sp for s in samples[rise_i:]]
-            osc = sum(1 for i in range(1, len(diffs)) if diffs[i] * diffs[i-1] < 0)
+            # Only count sign changes where error exceeds 10% of setpoint
+            significant = [d for d in diffs if abs(d) > sp * 0.10]
+            osc = sum(1 for i in range(1, len(significant))
+                      if significant[i] * significant[i-1] < 0)
         else:
             osc = 0
 
@@ -1725,6 +1766,10 @@ class StepResponseWindow(tk.Toplevel):
             f"{steady_err:.0f} RPM" if steady_err is not None else "--")
         self._metric_vars["oscillations"].set(str(osc))
 
+        print(f"Step analysis: rise={rise_s} overshoot={overshoot:.1f}% "
+              f"settling={settling_s} steady_err={steady_err} osc={osc} "
+              f"sp={sp:.0f} n={n}")
+
         try:
             kp = float(self.panel.cfg.get("kp", 0.05))
             ki = float(self.panel.cfg.get("ki", 0.02))
@@ -1735,9 +1780,28 @@ class StepResponseWindow(tk.Toplevel):
         suggestions = []
         if rise_i is None:
             new_kp = round(kp * 2, 4)
-            suggestions.append((
-                "⚠ Motor did not reach setpoint — increase Kp",
-                lambda v=new_kp: self._apply_gain("kp", v)))
+            # Check if PWM was saturated — means setpoint is above motor capability
+            if len(self._samples) >= 20:
+                # We don't have PWM samples directly — check if RPM flatlined
+                last_20 = self._samples[-20:]
+                rpm_range = max(last_20) - min(last_20)
+                avg_last  = sum(last_20) / len(last_20)
+                if rpm_range < 50 and avg_last < sp * 0.85:
+                    suggestions.append((
+                        f"⚠ Motor flatlined at {avg_last:.0f} RPM — setpoint {sp:.0f} RPM "
+                        f"may exceed motor capability.\n"
+                        f"  Reduce Max Output RPM in Settings to {avg_last/cfg.get('gear_ratio',1):.0f} RPM "
+                        f"(current: {cfg.get('max_output_rpm', DEFAULT_MAX_OUTPUT_RPM):.0f})",
+                        None
+                    ))
+                else:
+                    suggestions.append((
+                        "⚠ Motor did not reach setpoint — increase Kp",
+                        lambda v=new_kp: self._apply_gain("kp", v)))
+            else:
+                suggestions.append((
+                    "⚠ Motor did not reach setpoint — increase Kp",
+                    lambda v=new_kp: self._apply_gain("kp", v)))
         elif osc >= 3:
             new_kp = round(kp * 0.7, 4)
             suggestions.append((
@@ -1755,28 +1819,118 @@ class StepResponseWindow(tk.Toplevel):
                 lambda v=new_kd: self._apply_gain("kd", v)))
         if rise_s is not None and rise_s > 2.0 and osc < 3:
             new_kp = round(kp * 1.3, 4)
+            current_step = int(cfg.get("max_pwm_step", DEFAULT_MAX_PWM_STEP))
+            new_step = min(50, current_step * 2)
             suggestions.append((
                 f"ℹ Slow rise ({rise_s:.1f}s) — increase Kp  →  Kp = {new_kp}",
-                lambda v=new_kp: self._apply_gain("kp", v)))
+                lambda v=new_kp: self._apply_gain("kp", v)
+            ))
+            suggestions.append((
+                f"ℹ PWM Step {current_step} limits ramp speed  →  Step = {new_step}",
+                lambda v=new_step: self._apply_gain("max_pwm_step", v)
+            ))
         if steady_err is not None and steady_err > sp * 0.05:
             new_ki = round(ki * 1.5, 5)
             suggestions.append((
                 f"ℹ Steady error {steady_err:.0f} RPM — increase Ki  →  Ki = {new_ki}",
                 lambda v=new_ki: self._apply_gain("ki", v)))
-        if (rise_s is not None and rise_s < 1.0 and overshoot < 5
-                and osc < 2 and steady_err is not None and steady_err < sp * 0.05):
+        if (rise_s is not None and rise_s < 2.0 and
+                overshoot < 10 and osc < 2 and
+                steady_err is not None and steady_err < sp * 0.05):
             suggestions.append(("✓ Well tuned — consider saving gains", None))
         if not suggestions:
             suggestions.append(
-                ("ℹ Response looks reasonable — fine-tune in PID Tuning window", None))
+                ("ℹ Response looks good — save gains if happy, or fine-tune Kd "
+                 "in the PID Tuning window to reduce any remaining overshoot", None))
 
-        for i, (var, btn, ah) in enumerate(self._sugg_rows):
+        # Populate suggestion rows with colour coding
+        for i, (var, lbl, btn, ah) in enumerate(self._sugg_rows):
             if i < len(suggestions):
                 text, action = suggestions[i]
-                var.set(text); ah[0] = action
+                var.set(text)
+                ah[0] = action
+                colour = ("green"   if text.startswith("✓") else
+                          "red"     if text.startswith("⚠") else
+                          "#4488cc" if text.startswith("ℹ") else
+                          "black")
+                lbl.configure(foreground=colour)
                 btn.grid() if action else btn.grid_remove()
             else:
-                var.set(""); ah[0] = None; btn.grid_remove()
+                var.set("")
+                ah[0] = None
+                btn.grid_remove()
+
+    def _refresh_gains_display(self):
+        """Update the gains display from current panel config."""
+        cfg = self.panel.cfg
+        fmt = {
+            "kp":             "g",
+            "ki":             "g",
+            "kd":             "g",
+            "integral_limit": ".0f",
+            "max_pwm_step":   ".0f",
+        }
+        defaults = {
+            "kp": DEFAULT_KP, "ki": DEFAULT_KI, "kd": DEFAULT_KD,
+            "integral_limit": DEFAULT_INTEGRAL_LIMIT,
+            "max_pwm_step": DEFAULT_MAX_PWM_STEP,
+        }
+        for key, var in self._gains_display_vars.items():
+            val = cfg.get(key, defaults.get(key, 0))
+            try:
+                var.set(f"{float(val):{fmt[key]}}")
+            except (ValueError, TypeError):
+                var.set(str(val))
+
+    def _apply_manual_gains(self):
+        """Apply all gain values from the editable fields to firmware."""
+        keys = {
+            "kp":             ("nonneg",   float),
+            "ki":             ("nonneg",   float),
+            "kd":             ("nonneg",   float),
+            "integral_limit": ("positive", float),
+            "max_pwm_step":   ("positive", int),
+        }
+        app = self._get_app()
+        if not app:
+            self.status_var.set("Not connected")
+            return
+        motor_key = str(self.panel.motor_id)
+        for key, (rule, cast) in keys.items():
+            try:
+                v = cast(self._gains_display_vars[key].get())
+                if rule == "positive" and v <= 0:
+                    raise ValueError
+                if rule == "nonneg"   and v <  0:
+                    raise ValueError
+                self.panel.cfg[key] = v
+                app.motor_config[motor_key][key] = v
+            except (ValueError, TypeError):
+                self.status_var.set(f"Invalid value for {key}")
+                return
+        if self.panel.send_config:
+            self.panel.send_config(self.panel.motor_id, debug_enabled=False)
+        self._refresh_gains_display()
+        self.status_var.set("Gains applied — run test to verify")
+
+    def _save_gains(self):
+        """Persist current panel.cfg gains to motor_config.json."""
+        app = self._get_app()
+        if not app:
+            self.status_var.set("Not connected — cannot save")
+            return
+        motor_key = str(self.panel.motor_id)
+        # Merge current panel cfg gains into app motor_config
+        for key in ("kp", "ki", "kd", "integral_limit", "max_pwm_step"):
+            val = self.panel.cfg.get(key)
+            if val is not None:
+                app.motor_config[motor_key][key] = val
+        if save_motor_config(app.motor_config):
+            self.status_var.set("✓ Gains saved to motor_config.json")
+            self._refresh_gains_display()
+            self.after(3000, lambda: self.status_var.set("Ready"))
+        else:
+            self.status_var.set("✗ Failed to save — check file permissions")
 
     def _apply_gain(self, key, value):
         app = self._get_app()
@@ -1787,6 +1941,7 @@ class StepResponseWindow(tk.Toplevel):
         self.panel.cfg[key] = value
         if self.panel.send_config:
             self.panel.send_config(self.panel.motor_id, debug_enabled=False)
+        self._refresh_gains_display()
         self.status_var.set(f"Applied {key} = {value} — run again to verify")
 
     def _export_csv(self):
@@ -1847,17 +2002,25 @@ class MotorTestsWindow(tk.Toplevel):
                   font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 10))
 
         self._enc_card = self._build_card(container,
-            "Encoder Direction",
+            "① Encoder Direction",
             "Spins the motor CW briefly and checks whether the encoder\n"
             "counts in the correct direction. Automatically sets the\n"
             "encoder inversion flag in Settings if needed.",
             self._run_encoder_test)
 
+        self._rpm_card = self._build_card(container,
+            "② Max RPM Calibration",
+            "Spins the motor at full PWM for 2 seconds and measures\n"
+            "the actual maximum RPM. Suggests updating Max Output RPM\n"
+            "in Settings to match your specific motor.",
+            self._run_max_rpm_test)
+
         self._step_card = self._build_card(container,
-            "Step Response",
-            "Enables PID at 75% of max motor RPM from a standing start\n"
-            "and records the response for 5 seconds. Plots the curve\n"
-            "and suggests PID gain adjustments.",
+            "③ Step Response",
+            "Enables PID at 75% of max output RPM from a standing start\n"
+            "and records the response for 10 seconds. Plots the curve\n"
+            "and suggests PID gain adjustments.\n"
+            "Run ② Max RPM Calibration first for best results.",
             self._run_step_test)
 
         ttk.Button(container, text="Close",
@@ -1883,6 +2046,110 @@ class MotorTestsWindow(tk.Toplevel):
         card._result_var.set(text)
         card._result_lbl.configure(foreground=colour)
         card._result_lbl.grid()
+
+    def _run_max_rpm_test(self, card):
+        app = self._get_app()
+        if not app or not app.serial_port or not app.serial_port.is_open:
+            self._set_result(card, "✗ Not connected", "red")
+            return
+
+        card._btn.configure(state="disabled", text="Running...")
+        self._set_result(card, "⏳ Spinning at full PWM...", "gray")
+        self.update()
+
+        panel = self.panel
+        panel.motor_in1 = 1; panel.motor_in2 = 0
+        panel.motor_pwm = 255
+        panel.reset_direction_styles()
+        panel.btn_cw.configure(style="ActiveDir.TButton")
+        app.send_command()
+
+        # Collect RPM samples during the run
+        self._max_rpm_samples = []
+        self.after(500, lambda: self._collect_max_rpm(card, app, panel, 0))
+
+    def _collect_max_rpm(self, card, app, panel, count):
+        """Collect 15 RPM samples over 1.5 seconds after initial spin-up."""
+        try:
+            rpm_text = panel.shaft_rpm_var.get()
+            rpm = float(rpm_text)
+            if rpm > 0:
+                self._max_rpm_samples.append(rpm)
+        except ValueError:
+            pass
+
+        count += 1
+        self._set_result(card,
+            f"⏳ Measuring... ({count}/15)  current: {panel.shaft_rpm_var.get()} RPM",
+            "gray")
+        self.update()
+
+        if count < 15:
+            self.after(100, lambda: self._collect_max_rpm(card, app, panel, count))
+        else:
+            self._finish_max_rpm(card, app, panel)
+
+    def _finish_max_rpm(self, card, app, panel):
+        # Stop motor
+        panel.motor_in1 = 0; panel.motor_in2 = 0
+        panel.motor_pwm = 0
+        panel.reset_direction_styles()
+        panel.btn_stop.configure(style="ActiveStop.TButton")
+        app.send_command()
+
+        card._btn.configure(state="normal", text="▶  Run")
+
+        if not self._max_rpm_samples:
+            self._set_result(card,
+                "✗ No RPM readings received — check encoder and connection", "red")
+            return
+
+        # Use the top 5 samples as the settled max
+        top_samples = sorted(self._max_rpm_samples)[-5:]
+        measured_max_shaft = sum(top_samples) / len(top_samples)
+        gear = panel.cfg.get("gear_ratio", 50.0)
+        measured_max_output = measured_max_shaft / gear if gear > 0 else measured_max_shaft
+        current_max = panel.cfg.get("max_output_rpm", DEFAULT_MAX_OUTPUT_RPM)
+
+        # Store suggested value for the Apply button
+        suggested = round(measured_max_output, 1)
+
+        def apply_max_rpm(v=suggested):
+            motor_key = str(panel.motor_id)
+            app_ref = self._get_app()
+            if app_ref:
+                app_ref.motor_config[motor_key]["max_output_rpm"] = v
+                panel.cfg["max_output_rpm"] = v
+                panel.apply_config(panel.cfg)
+                save_motor_config(app_ref.motor_config)
+            self._set_result(card,
+                f"✓ Max Output RPM updated to {v:.1f} RPM and saved\n"
+                f"  Step Response test will now target {v*0.75:.1f} RPM (75%)",
+                "green")
+
+        # Build result with Apply button
+        result_text = (
+            f"Measured max: {measured_max_output:.1f} output RPM  "
+            f"({measured_max_shaft:.0f} motor shaft RPM)\n"
+            f"Current setting: {current_max:.1f} RPM  →  Suggested: {suggested:.1f} RPM"
+        )
+        card._result_var.set(result_text)
+        card._result_lbl.configure(foreground="gray" if abs(suggested - current_max) < 2 else "orange")
+        card._result_lbl.grid()
+
+        # Add Apply button if suggestion differs from current
+        if abs(suggested - current_max) >= 1:
+            if not hasattr(card, '_apply_btn'):
+                card._apply_btn = ttk.Button(card, text="Apply →",
+                                             command=apply_max_rpm)
+                card._apply_btn.grid(row=2, column=1, padx=(4, 8), pady=(4, 0), sticky="e")
+            else:
+                card._apply_btn.configure(command=apply_max_rpm)
+                card._apply_btn.grid()
+        else:
+            self._set_result(card,
+                f"✓ Max RPM matches setting  ({measured_max_output:.1f} RPM measured, "
+                f"{current_max:.1f} RPM configured)", "green")
 
     def _run_encoder_test(self, card):
         app = self._get_app()
@@ -1918,24 +2185,27 @@ class MotorTestsWindow(tk.Toplevel):
                 "✗ Motor did not spin — check wiring and motor enable", "red")
             return
         motor_key = str(panel.motor_id)
+        currently_inverted = app.motor_config.get(motor_key, {}).get(
+            "encoder_inverted", False)
+
         if direction == "CW":
-            app.motor_config[motor_key]["encoder_inverted"] = False
-            panel.cfg["encoder_inverted"] = False
-            save_motor_config(app.motor_config)
-            if panel.send_config:
-                panel.send_config(panel.motor_id, debug_enabled=False)
+            # CW command shows CW — current setting is already correct, no change
             self._set_result(card,
-                f"✓ Encoder direction correct  ({rpm:.0f} RPM CW)\n"
-                f"  encoder_inverted set to False and saved", "green")
+                f"✓ Encoder direction correct  ({rpm:.0f} RPM showing CW)\n"
+                f"  Current setting (encoder_inverted={currently_inverted}) is correct — no change made.",
+                "green")
         else:
-            app.motor_config[motor_key]["encoder_inverted"] = True
-            panel.cfg["encoder_inverted"] = True
+            # CW command shows wrong direction — flip the current inversion setting
+            new_inverted = not currently_inverted
+            app.motor_config[motor_key]["encoder_inverted"] = new_inverted
+            panel.cfg["encoder_inverted"] = new_inverted
             save_motor_config(app.motor_config)
             if panel.send_config:
                 panel.send_config(panel.motor_id, debug_enabled=False)
             self._set_result(card,
-                f"⚠ Encoder inverted  ({rpm:.0f} RPM showed as {direction})\n"
-                f"  encoder_inverted automatically set to True and saved", "orange")
+                f"⚠ Encoder showing {direction} when set to CW  ({rpm:.0f} RPM)\n"
+                f"  encoder_inverted changed {currently_inverted} → {new_inverted} and saved",
+                "orange")
 
     def _run_step_test(self, card):
         StepResponseWindow(self.winfo_toplevel(), self.panel)
@@ -1960,7 +2230,7 @@ class SettingsWindow(tk.Toplevel):
     FIELDS = [
         ("ppr",              "PPR",             "Encoder lines/gaps per motor shaft revolution (datasheet value)", "positive"),
         ("gear_ratio",       "Gear Ratio",      "Motor shaft revs per output shaft rev (1.0 = no gearbox)",       "positive"),
-        ("max_motor_rpm",    "Max Motor RPM",   "Sets setpoint slider range",                                      "positive"),
+        ("max_output_rpm",   "Max Output RPM",  "Maximum output shaft RPM (from motor label, e.g. 120 RPM)",      "positive"),
         ("wheel_diameter_mm","Wheel Dia (mm)",  "Output shaft wheel diameter. 0 = no wheel",                      "nonneg"),
     ]
 
